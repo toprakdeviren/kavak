@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/parser.c
  * @brief Parser toolkit: recursive-descent helpers, checkpoints, Pratt core.
@@ -162,28 +163,63 @@ const KavakToken *kavak_parser_expect_text(KavakParser *parser, const uint32_t k
   return NULL;
 }
 
+static int recovery_target_matches(const KavakToken *token,
+                                   const uint32_t *kinds,
+                                   const uint32_t kind_count) {
+  if (!token) return 0;
+  if (token->kind == KAVAK_TOK_PUNCT &&
+      (token->v == '(' || token->v == '[' || token->v == '{')) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < kind_count; ++i) {
+    if (token->kind == kinds[i]) return 1;
+  }
+  return 0;
+}
+
+static void recovery_update_depth(const KavakToken *token, uint32_t *depth) {
+  if (!token || token->kind != KAVAK_TOK_PUNCT || !depth) return;
+  switch (token->v) {
+    case '(':
+    case '[':
+    case '{':
+      if (*depth != UINT32_MAX) (*depth)++;
+      break;
+    case ')':
+    case ']':
+    case '}':
+      if (*depth != 0) (*depth)--;
+      break;
+  }
+}
+
 void kavak_parser_recover_to(KavakParser *parser, const uint32_t *kinds,
                              const uint32_t kind_count) {
   if (!parser) return;
+  uint32_t depth = 0;
   while (!kavak_parser_at_end(parser)) {
     const KavakToken *token = kavak_parser_peek(parser);
-    for (uint32_t i = 0; i < kind_count; ++i) {
-      if (token->kind == kinds[i]) return;
-    }
+    if (depth == 0 && recovery_target_matches(token, kinds, kind_count)) return;
+    recovery_update_depth(token, &depth);
     (void)parser_advance(parser);
   }
 }
 
-KavakASTNode *kavak_parser_make_node(KavakParser *parser, const uint32_t kind) {
+static KavakASTNode *parser_make_node_at(KavakParser *parser,
+                                         const uint32_t kind,
+                                         const uint32_t first_token) {
   if (!parser || !parser->arena) return NULL;
   KavakASTNode *node = kavak_arena_alloc(parser->arena, sizeof(*node));
   if (!node) return NULL;
   node->kind = kind;
-  node->payload.range.first_token = parser->pos;
-  node->payload.range.last_token = parser->pos;
-  const KavakToken *token = kavak_parser_peek(parser);
-  if (token) node->span = token->span;
+  node->payload.range.first_token = first_token;
+  node->payload.range.last_token = first_token;
+  if (first_token < parser->token_count) node->span = parser->tokens[first_token].span;
   return node;
+}
+
+KavakASTNode *kavak_parser_make_node(KavakParser *parser, const uint32_t kind) {
+  return parser_make_node_at(parser, kind, parser ? parser->pos : 0);
 }
 
 static KavakSpan span_for_token_range(const KavakParser *parser,
@@ -213,12 +249,8 @@ void kavak_parser_finish_node(KavakParser *parser, KavakASTNode *node) {
     child_span = kavak_span_union(child_span, child->span);
   }
 
-  if (!kavak_span_is_empty(child_span)) {
-    node->span = child_span;
-    return;
-  }
-
-  node->span = span_for_token_range(parser, first, last);
+  const KavakSpan token_span = span_for_token_range(parser, first, last);
+  node->span = kavak_span_union(token_span, child_span);
 }
 
 KavakParserCheckpoint kavak_parser_checkpoint(const KavakParser *parser) {
@@ -287,7 +319,8 @@ static KavakASTNode *parse_prefix_expr(KavakParser *parser) {
   }
 
   if (kavak_parser_eat_text(parser, KAVAK_TOK_PUNCT, "(")) {
-    KavakASTNode *group = kavak_parser_make_node(parser, KAVAK_AST_GROUP);
+    const uint32_t open_token = parser->pos > 0 ? parser->pos - 1u : 0;
+    KavakASTNode *group = parser_make_node_at(parser, KAVAK_AST_GROUP, open_token);
     KavakASTNode *expr = kavak_parse_expression(parser, 0);
     if (group && expr) kavak_ast_append_child(group, expr);
     (void)kavak_parser_expect_text(parser, KAVAK_TOK_PUNCT, ")", "expected ')'");

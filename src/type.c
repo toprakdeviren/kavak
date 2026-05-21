@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/type.c
  * @brief Type-system toolkit: TypeInfo arena, constructors, helpers.
@@ -235,40 +236,6 @@ KavakTypeInfo *kavak_ty_record(KavakTypeArena *arena,
   return type;
 }
 
-int kavak_ty_equal_nominal(const KavakTypeInfo *a, const KavakTypeInfo *b) {
-  if (a == b) return 1;
-  if (!a || !b || a->kind != b->kind) return 0;
-  if (is_builtin_kind(a->kind)) return 1;
-
-  switch (a->kind) {
-    case KAVAK_TY_NULLABLE:
-      return b->payload.nullable.inner != NULL;
-    case KAVAK_TY_FUNCTION:
-      return a->flags == b->flags &&
-             (!!a->payload.function.receiver == !!b->payload.function.receiver) &&
-             a->payload.function.param_count == b->payload.function.param_count;
-    case KAVAK_TY_NAMED:
-      return str_eq(a->payload.named.name, b->payload.named.name) &&
-             a->payload.named.arg_count == b->payload.named.arg_count;
-    case KAVAK_TY_PARAM:
-      return a->payload.param.index == b->payload.param.index &&
-             str_eq(a->payload.param.name, b->payload.param.name);
-    case KAVAK_TY_RECORD:
-      if (a->payload.record.positional_count != b->payload.record.positional_count ||
-          a->payload.record.named_count != b->payload.record.named_count) {
-        return 0;
-      }
-      for (uint32_t i = 0; i < a->payload.record.named_count; ++i) {
-        if (!str_eq(a->payload.record.named[i].name,
-                    b->payload.record.named[i].name)) {
-          return 0;
-        }
-      }
-      return 1;
-  }
-  return 0;
-}
-
 static int equal_pair_seen(const TypeEqualCtx *ctx,
                            const KavakTypeInfo *a,
                            const KavakTypeInfo *b) {
@@ -286,6 +253,60 @@ static int equal_pair_push(TypeEqualCtx *ctx,
   return 1;
 }
 
+static int type_equal_nominal_inner(const KavakTypeInfo *a,
+                                    const KavakTypeInfo *b,
+                                    TypeEqualCtx *ctx) {
+  if (a == b) return 1;
+  if (!a || !b || a->kind != b->kind) return 0;
+  if (is_builtin_kind(a->kind)) return 1;
+  if (equal_pair_seen(ctx, a, b)) return 1;
+  if (!equal_pair_push(ctx, a, b)) return 0;
+
+  const uint32_t mark = ctx->count - 1u;
+  int equal = 0;
+
+  switch (a->kind) {
+    case KAVAK_TY_NULLABLE:
+      equal = type_equal_nominal_inner(a->payload.nullable.inner,
+                                       b->payload.nullable.inner, ctx);
+      break;
+    case KAVAK_TY_FUNCTION:
+      equal = a->flags == b->flags &&
+              (!!a->payload.function.receiver == !!b->payload.function.receiver) &&
+              a->payload.function.param_count == b->payload.function.param_count;
+      break;
+    case KAVAK_TY_NAMED:
+      equal = str_eq(a->payload.named.name, b->payload.named.name) &&
+              a->payload.named.arg_count == b->payload.named.arg_count;
+      break;
+    case KAVAK_TY_PARAM:
+      equal = a->payload.param.index == b->payload.param.index &&
+              str_eq(a->payload.param.name, b->payload.param.name);
+      break;
+    case KAVAK_TY_RECORD:
+      if (a->payload.record.positional_count != b->payload.record.positional_count ||
+          a->payload.record.named_count != b->payload.record.named_count) {
+        break;
+      }
+      equal = 1;
+      for (uint32_t i = 0; i < a->payload.record.named_count; ++i) {
+        if (!str_eq(a->payload.record.named[i].name,
+                    b->payload.record.named[i].name)) {
+          equal = 0;
+          break;
+        }
+      }
+      break;
+  }
+  ctx->count = mark;
+  return equal;
+}
+
+int kavak_ty_equal_nominal(const KavakTypeInfo *a, const KavakTypeInfo *b) {
+  TypeEqualCtx ctx = {0};
+  return type_equal_nominal_inner(a, b, &ctx);
+}
+
 static int type_equal_deep_inner(const KavakTypeInfo *a, const KavakTypeInfo *b,
                                  TypeEqualCtx *ctx) {
   if (a == b) return 1;
@@ -294,10 +315,14 @@ static int type_equal_deep_inner(const KavakTypeInfo *a, const KavakTypeInfo *b,
   if (equal_pair_seen(ctx, a, b)) return 1;
   if (!equal_pair_push(ctx, a, b)) return 0;
 
+  const uint32_t mark = ctx->count - 1u;
+  int equal = 0;
+
   switch (a->kind) {
     case KAVAK_TY_NULLABLE:
-      return type_equal_deep_inner(a->payload.nullable.inner,
-                                   b->payload.nullable.inner, ctx);
+      equal = type_equal_deep_inner(a->payload.nullable.inner,
+                                    b->payload.nullable.inner, ctx);
+      break;
     case KAVAK_TY_FUNCTION:
       if (a->flags != b->flags ||
           a->payload.function.param_count != b->payload.function.param_count ||
@@ -305,54 +330,64 @@ static int type_equal_deep_inner(const KavakTypeInfo *a, const KavakTypeInfo *b,
                                  b->payload.function.receiver, ctx) ||
           !type_equal_deep_inner(a->payload.function.ret,
                                  b->payload.function.ret, ctx)) {
-        return 0;
+        break;
       }
+      equal = 1;
       for (uint32_t i = 0; i < a->payload.function.param_count; ++i) {
         if (!type_equal_deep_inner(a->payload.function.params[i],
                                    b->payload.function.params[i], ctx)) {
-          return 0;
+          equal = 0;
+          break;
         }
       }
-      return 1;
+      break;
     case KAVAK_TY_NAMED:
       if (!str_eq(a->payload.named.name, b->payload.named.name) ||
           a->payload.named.arg_count != b->payload.named.arg_count ||
           a->payload.named.decl != b->payload.named.decl) {
-        return 0;
+        break;
       }
+      equal = 1;
       for (uint32_t i = 0; i < a->payload.named.arg_count; ++i) {
         if (!type_equal_deep_inner(a->payload.named.args[i],
                                    b->payload.named.args[i], ctx)) {
-          return 0;
+          equal = 0;
+          break;
         }
       }
-      return 1;
+      break;
     case KAVAK_TY_PARAM:
-      return a->payload.param.index == b->payload.param.index &&
-             a->payload.param.decl == b->payload.param.decl &&
-             str_eq(a->payload.param.name, b->payload.param.name);
+      equal = a->payload.param.index == b->payload.param.index &&
+              a->payload.param.decl == b->payload.param.decl &&
+              str_eq(a->payload.param.name, b->payload.param.name);
+      break;
     case KAVAK_TY_RECORD:
       if (a->payload.record.positional_count != b->payload.record.positional_count ||
           a->payload.record.named_count != b->payload.record.named_count) {
-        return 0;
+        break;
       }
+      equal = 1;
       for (uint32_t i = 0; i < a->payload.record.positional_count; ++i) {
         if (!type_equal_deep_inner(a->payload.record.positional[i],
                                    b->payload.record.positional[i], ctx)) {
-          return 0;
+          equal = 0;
+          break;
         }
       }
+      if (!equal) break;
       for (uint32_t i = 0; i < a->payload.record.named_count; ++i) {
         if (!str_eq(a->payload.record.named[i].name,
                     b->payload.record.named[i].name) ||
             !type_equal_deep_inner(a->payload.record.named[i].type,
                                    b->payload.record.named[i].type, ctx)) {
-          return 0;
+          equal = 0;
+          break;
         }
       }
-      return 1;
+      break;
   }
-  return 0;
+  ctx->count = mark;
+  return equal;
 }
 
 int kavak_ty_equal_deep(const KavakTypeInfo *a, const KavakTypeInfo *b) {

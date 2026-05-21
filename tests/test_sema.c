@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_sema.c
  * @brief Sema toolkit tests: scopes, narrowing, generic name resolve.

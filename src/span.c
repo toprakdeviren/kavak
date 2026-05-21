@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/span.c
  * @brief KavakSpan helpers that don't fit as `static inline` in the

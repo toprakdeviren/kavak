@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_token.c
  * @brief KavakToken shape + KavakTokenVec push/reserve/grow.

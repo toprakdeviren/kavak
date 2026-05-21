@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/kavak.c
  * @brief Top-level kavak entry points.
@@ -12,6 +13,7 @@
 #include <string.h>
 
 const char *kavak_version(void) { return KAVAK_VERSION_STRING; }
+void kavak_utf8_init(void);
 
 /* Session is opaque in kavak.h; the internal struct carries the
  * descriptor pointer and per-session type arena through the analysis
@@ -67,6 +69,7 @@ static void result_diag(KavakResult *result, const char *message) {
 
 KavakSession *kavak_session_new(const KavakLanguage *lang) {
   if (!lang) return NULL;
+  kavak_utf8_init();
   KavakSession *session = calloc(1, sizeof(*session));
   if (!session) return NULL;
   session->lang = lang;

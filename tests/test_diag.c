@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_diag.c
  * @brief KavakDiagVec push / error count / GCC-style format.

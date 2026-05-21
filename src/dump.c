@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/dump.c
  * @brief Generic AST debug dumpers for KavakResult.
@@ -35,6 +36,7 @@ static void dump_text_node(const KavakASTNode *node, FILE *out, const int depth,
                            DumpCtx *ctx) {
   if (!node) return;
   indent(out, depth);
+  const uint32_t mark = ctx->count;
   if (!dump_enter(ctx, node)) {
     fputs("<cycle-or-depth-limit>\n", out);
     return;
@@ -47,6 +49,7 @@ static void dump_text_node(const KavakASTNode *node, FILE *out, const int depth,
        child = child->next_sibling) {
     dump_text_node(child, out, depth + 1, ctx);
   }
+  ctx->count = mark;
 }
 
 void kavak_dump_text(const KavakResult *r, FILE *out) {
@@ -65,6 +68,7 @@ static void dump_json_node(const KavakASTNode *node, FILE *out, DumpCtx *ctx) {
     fputs("null", out);
     return;
   }
+  const uint32_t mark = ctx->count;
   if (!dump_enter(ctx, node)) {
     fputs("{\"cycle\":true}", out);
     return;
@@ -81,6 +85,7 @@ static void dump_json_node(const KavakASTNode *node, FILE *out, DumpCtx *ctx) {
     dump_json_node(child, out, ctx);
   }
   fputs("]}", out);
+  ctx->count = mark;
 }
 
 void kavak_dump_json(const KavakResult *r, FILE *out) {
@@ -95,6 +100,7 @@ static void dump_sexpr_node(const KavakASTNode *node, FILE *out, DumpCtx *ctx) {
     fputs("()", out);
     return;
   }
+  const uint32_t mark = ctx->count;
   if (!dump_enter(ctx, node)) {
     fputs("(:cycle)", out);
     return;
@@ -107,6 +113,7 @@ static void dump_sexpr_node(const KavakASTNode *node, FILE *out, DumpCtx *ctx) {
     dump_sexpr_node(child, out, ctx);
   }
   fputc(')', out);
+  ctx->count = mark;
 }
 
 void kavak_dump_sexpr(const KavakResult *r, FILE *out) {

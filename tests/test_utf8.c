@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_utf8.c
  * @brief UTF-8 decode validation + ASCII identifier predicates.

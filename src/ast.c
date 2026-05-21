@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/ast.c
  * @brief KavakASTNode layout guard.

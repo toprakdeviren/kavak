@@ -1,13 +1,11 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/lexer.c
  * @brief kavak_lex driver and token scanners.
  *
- * The spine of the lexer — main loop, position cursor, EOF emit, and
- * bad-byte recovery (KAVAK_TOK_INVALID + diag, advance one byte). Scanners
- * plug into scan_token() in fixed longest-match precedence order: comments,
- * strings/chars, numbers, identifiers, operators, then punctuation.
- * Any byte no scanner claims falls through to the unknown-char path.
- * The one-byte advance there keeps the loop terminating on bad input.
+ * The lexer walks a byte cursor and applies scanners in fixed precedence:
+ * comments, strings/chars, numbers, identifiers, operators, then punctuation.
+ * Unmatched bytes become KAVAK_TOK_INVALID with a diagnostic.
  */
 
 #include "kavak.h"
@@ -143,7 +141,7 @@ static int emit_invalid(Lexer *lex, const uint32_t start, const char *message) {
 
 /* ── Shared scanner substrate ────────────────────────────────────────── */
 
-/* Decode the codepoint at lex->pos WITHOUT advancing. Returns bytes
+/* Decode the codepoint at lex->pos without advancing. Returns bytes
  * (1..4) on success, 0 at EOF or on invalid UTF-8 (the kavak_utf8_decode
  * contract). Scanners that walk past ASCII go through this so bad-UTF-8
  * handling is uniform at their own recovery boundary. */
@@ -152,10 +150,19 @@ static int peek_cp(const Lexer *lex, uint32_t *out_cp) {
                            lex->source->bytes + lex->source->len, out_cp);
 }
 
+static uint32_t utf8_recovery_len(const Lexer *lex) {
+  const unsigned char lead = peek(lex);
+  uint32_t expected = 1;
+  if (lead >= 0xC2 && lead <= 0xDF) expected = 2;
+  else if (lead >= 0xE0 && lead <= 0xEF) expected = 3;
+  else if (lead >= 0xF0 && lead <= 0xF4) expected = 4;
+  const uint32_t remaining = (uint32_t)lex->source->len - lex->pos;
+  return expected < remaining ? expected : remaining;
+}
+
 /* Does the source at lex->pos begin with the NUL-terminated literal
- * `lit`? Pure look-ahead — never advances pos, never reads past the
- * source end. The byte-string workhorse behind comment-open / block-
- * close detection, string delimiters, suffixes, and operators. */
+ * `lit`? Pure look-ahead: never advances pos, never reads past the
+ * source end. */
 static int match_lit(const Lexer *lex, const char *lit) {
   const size_t n = strlen(lit);
   if ((size_t)lex->pos + n > lex->source->len) return 0;
@@ -585,7 +592,14 @@ static ScanResult try_scan_string(Lexer *lex) {
         return emit_invalid(lex, fragment_start, "unterminated string literal") == 0
                  ? SCAN_MATCHED : SCAN_OOM;
       }
-      lex->pos++;
+      uint32_t cp = 0;
+      const int esc_len = esc < 0x80 ? 1 : peek_cp(lex, &cp);
+      const uint32_t advance = esc_len ? (uint32_t)esc_len : utf8_recovery_len(lex);
+      lex->pos += advance;
+      if (esc_len == 0 && esc >= 0x80) {
+        push_diag(lex, kavak_span_make(esc_start + 1u, advance),
+                  "invalid UTF-8 in string escape");
+      }
       if (!escape_is_allowed(rule, esc)) {
         push_diag(lex, kavak_span_from_to(esc_start, lex->pos),
                   "invalid escape sequence");
@@ -619,7 +633,7 @@ static ScanResult try_scan_string(Lexer *lex) {
  * comment when config.keep_doc_comments is set; any other comment is
  * skipped silently (MATCHED, no token). When several rules could open
  * here the longest `open` wins — a "///" doc rule beats a "//" line rule —
- * so config order is not load-bearing. */
+ * so config order does not affect matching. */
 static ScanResult try_scan_comment(Lexer *lex) {
   const KavakLexerConfig *cfg = lex->config;
 
@@ -671,10 +685,9 @@ static ScanResult try_scan_comment(Lexer *lex) {
 /* ── Operator + punctuation scanner (longest-match) ─────────────────── */
 
 /* The longest operator in config.operators matching at lex->pos, or NULL.
- * Scans the whole table (config order is not load-bearing), so `<<=` wins
- * over `<<` over `<`, and `==` over `=`. This is the load-bearing
- * correctness helper of the symbolic lexer. Multi-byte UTF-8
- * spellings (e.g. "≠") fall out for free — match_lit compares raw bytes. */
+ * Scans the whole table, so `<<=` wins over `<<` over `<`, and `==`
+ * over `=` regardless of config order. Multi-byte spellings compare as
+ * raw bytes. */
 static const KavakOperator *match_longest_op(const Lexer *lex) {
   const KavakLexerConfig *cfg = lex->config;
   const KavakOperator    *best = NULL;

@@ -23,12 +23,16 @@ BUILDDIR  = $(ROOT)build
 DECODER_ROOT ?= $(abspath $(ROOT)../../decoder)
 DECODER_LIB  ?= $(DECODER_ROOT)/build/libunicode.a
 DECODER_WASM_LIB ?= $(DECODER_ROOT)/build/wasm/libunicode.a
-DECODER_INCLUDES = -I$(DECODER_ROOT)/include
 DECODER_LDLIBS ?= -lm -lpthread
 LIBTOOL ?= libtool
 PKG_CONFIG_DIR ?= $(PREFIX)/lib/pkgconfig
+DECODER_WRAPDIR = $(BUILDDIR)/generated/include
+DECODER_WRAP_HEADERS = \
+  $(DECODER_WRAPDIR)/kavak_decoder/core.h \
+  $(DECODER_WRAPDIR)/kavak_decoder/encoding.h \
+  $(DECODER_WRAPDIR)/kavak_decoder/security.h
 
-INCLUDES  = -I$(INCDIR) $(DECODER_INCLUDES)
+INCLUDES  = -I$(INCDIR) -I$(DECODER_WRAPDIR)
 
 SRCS = \
   $(SRCDIR)/arena.c \
@@ -90,13 +94,17 @@ $(DECODER_LIB): FORCE
 	$(require_decoder_root)
 	@$(MAKE) -C "$(DECODER_ROOT)" lib
 
+$(DECODER_WRAPDIR)/kavak_decoder/%.h: $(DECODER_ROOT)/include/%.h Makefile
+	@mkdir -p $(dir $@)
+	@printf '#include "%s"\n' "$<" > $@
+
 $(LIB): $(OBJS) $(DECODER_LIB) Makefile
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "AR" "$(notdir $@)"
 	$(call merge_native_archive,$@,$(OBJS),$(DECODER_LIB))
 	@echo "  ✓ libkavak"
 
-$(BUILDDIR)/%.o: $(ROOT)%.c
+$(BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "CC" "$(notdir $<)"
 	@$(CC) $(CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
@@ -169,7 +177,7 @@ $(BENCH_LIB): $(BENCH_OBJS) $(DECODER_LIB) Makefile
 	$(call merge_native_archive,$@,$(BENCH_OBJS),$(DECODER_LIB))
 	@echo "  ✓ bench libkavak"
 
-$(BENCH_BUILDDIR)/%.o: $(ROOT)%.c
+$(BENCH_BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "CC" "$(notdir $<)"
 	@$(CC) $(BENCH_CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
@@ -191,7 +199,7 @@ tsan: $(TSAN_DIR)/test_threads
 	@printf "  %-7s %s\n" "TSAN" "test_threads"
 	@$<
 
-$(TSAN_DIR)/test_threads: $(SRCS) $(TESTDIR)/test_threads.c $(DECODER_LIB)
+$(TSAN_DIR)/test_threads: $(SRCS) $(TESTDIR)/test_threads.c $(DECODER_LIB) $(DECODER_WRAP_HEADERS)
 	@mkdir -p $(TSAN_DIR)
 	@printf "  %-7s %s\n" "LINK" "test_threads (TSan)"
 	@$(CC) $(TSAN_FLAGS) $(INCLUDES) $(SRCS) $(TESTDIR)/test_threads.c \
@@ -210,7 +218,7 @@ sanitize: $(SAN_BINS)
 	  $$t || exit $$?; \
 	done
 
-$(SAN_DIR)/tests/%: $(TESTDIR)/%.c $(SRCS) $(DECODER_LIB)
+$(SAN_DIR)/tests/%: $(TESTDIR)/%.c $(SRCS) $(DECODER_LIB) $(DECODER_WRAP_HEADERS)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "LINK" "$(notdir $@) (ASan/UBSan)"
 	@$(CC) $(SAN_FLAGS) $(INCLUDES) $(SRCS) $< \
@@ -247,7 +255,7 @@ $(WASM_LIB): $(WASM_OBJS) $(DECODER_WASM_LIB) Makefile
 	} | $(WASM_AR) -M
 	@echo "  ✓ wasm libkavak + decoder"
 
-$(WASM_BUILDDIR)/%.o: $(ROOT)%.c
+$(WASM_BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "EMCC" "$(notdir $<)"
 	@$(WASM_CC) $(WASM_CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@

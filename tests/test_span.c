@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_span.c
  * @brief KavakSpan constructors, queries, and union.

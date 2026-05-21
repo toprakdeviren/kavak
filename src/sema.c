@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/sema.c
  * @brief Sema toolkit: scopes, name resolution, narrowing helpers.

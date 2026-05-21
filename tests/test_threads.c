@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_threads.c
  * @brief ThreadSanitizer smoke test for independent sessions.

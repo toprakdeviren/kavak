@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/arena.c
  * @brief KavakArena — bump allocator with growable chunks.

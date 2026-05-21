@@ -1,33 +1,24 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file src/utf8.c
  * @brief UTF-8 decoding and identifier predicates.
- *
- * kavak now delegates UTF-8 validation/conversion and Unicode identifier
- * predicates to decoder, which is built as a static library by the Makefile.
  */
 
 #include "kavak.h"
 
-#include <core.h>
-#include <encoding.h>
-#include <security.h>
+#include <kavak_decoder/core.h>
+#include <kavak_decoder/encoding.h>
+#include <kavak_decoder/security.h>
 
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
+void kavak_utf8_init(void) {
+  decoder_init();
+}
+
 static void kavak_decoder_ensure_init(void) {
-  static atomic_int state = ATOMIC_VAR_INIT(0);
-  int expected = 0;
-  if (atomic_load_explicit(&state, memory_order_acquire) == 2) return;
-  if (atomic_compare_exchange_strong_explicit(&state, &expected, 1,
-                                              memory_order_acq_rel,
-                                              memory_order_acquire)) {
-    decoder_init();
-    atomic_store_explicit(&state, 2, memory_order_release);
-    return;
-  }
-  while (atomic_load_explicit(&state, memory_order_acquire) != 2) {}
+  kavak_utf8_init();
 }
 
 static int utf8_lead_len(const unsigned char lead) {

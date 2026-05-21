@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_parser.c
  * @brief Parser toolkit tests: RD helpers, Pratt, recovery, speculation.
@@ -277,6 +278,20 @@ static int test_nonassoc_operator_chain_reports_diag(void) {
   return 0;
 }
 
+static int test_group_span_includes_delimiters(void) {
+  ParserFixture fixture;
+  ASSERT(fixture_init(&fixture, "(1 + 2)") == 0, "fixture init");
+  ASSERT(fixture.diags.count == 0, "lex clean");
+
+  KavakASTNode *expr = kavak_parse_expression(fixture.parser, 0);
+  ASSERT(expr && expr->kind == KAVAK_AST_GROUP, "group parsed");
+  ASSERT(expr->span.start == 0, "group span starts at open paren");
+  ASSERT(expr->span.len == 7, "group span includes closing paren");
+
+  fixture_free(&fixture);
+  return 0;
+}
+
 static int try_parse_turbofish(KavakParser *parser) {
   KavakParserCheckpoint checkpoint = kavak_parser_checkpoint(parser);
   if (!kavak_parser_eat(parser, KAVAK_TOK_IDENT)) goto fail;
@@ -337,6 +352,20 @@ static int test_recover_to_kind(void) {
   return 0;
 }
 
+static int test_recover_skips_nested_punctuation(void) {
+  ParserFixture fixture;
+  ASSERT(fixture_init(&fixture, "(1;); next") == 0, "fixture init");
+  static const uint32_t recovery[] = { KAVAK_TOK_PUNCT };
+  kavak_parser_recover_to(fixture.parser, recovery, sizeof(recovery) / sizeof(*recovery));
+  ASSERT(kavak_parser_check_text(fixture.parser, KAVAK_TOK_PUNCT, ";"),
+         "recovered to outer punctuation");
+  ASSERT(kavak_parser_peek(fixture.parser)->span.start == 4,
+         "inner punctuation skipped");
+
+  fixture_free(&fixture);
+  return 0;
+}
+
 static int test_expression_depth_limit(void) {
   enum { DEPTH = 600 };
   char src[(DEPTH * 2) + 2];
@@ -370,13 +399,15 @@ int main(void) {
   fails += test_pratt_precedence();
   fails += test_tinylang_parse_smoke();
   fails += test_nonassoc_operator_chain_reports_diag();
+  fails += test_group_span_includes_delimiters();
   fails += test_speculative_turbofish();
   fails += test_checkpoint_rewinds_diags();
   fails += test_recover_to_kind();
+  fails += test_recover_skips_nested_punctuation();
   fails += test_expression_depth_limit();
 
   if (fails == 0) {
-    printf("  ✓ test_parser: 7/7 passed\n");
+    printf("  ✓ test_parser: 9/9 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_parser: %d failure(s)\n", fails);

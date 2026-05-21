@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_lexer_offside.c
  * @brief Offside-rule lexer tests.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_arena.c
  * @brief KavakArena smoke + invariants.

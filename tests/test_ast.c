@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_ast.c
  * @brief KavakASTNode header layout gate.

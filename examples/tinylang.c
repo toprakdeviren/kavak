@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file examples/tinylang.c
  * @brief Small kavak language descriptor using lexer, parser, sema, types, dumps.

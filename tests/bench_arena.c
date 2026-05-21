@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/bench_arena.c
  * @brief Arena-churn benchmark for narrowing-style allocations.

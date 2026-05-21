@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_lexer.c
  * @brief kavak_lex driver and scanner tests.
@@ -153,7 +154,7 @@ static const KavakLexerConfig CMT_DOC_SKIP = {
 
 /* Operator table. Listed shortest-first on purpose: a naive
  * first-match scan would stop at "<" / "=", so passing the longest-match
- * tests proves table order is not load-bearing. "\xE2\x89\xA0" is "≠"
+ * tests proves table order does not affect matching. "\xE2\x89\xA0" is "≠"
  * (U+2260) — a 3-byte UTF-8 spelling. prec/assoc/flags are Pratt
  * data the lexer ignores; only text + op_id matter here. */
 enum {
@@ -1234,6 +1235,28 @@ static int test_string_invalid_escape_keeps_token(void) {
   return 0;
 }
 
+static int test_string_invalid_utf8_escape_skips_sequence(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex_with(&STR_CONFIG, "\"\\\xE2\x28\xA1\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 2, "STRING + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] STRING still emitted");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 6,
+         "[0] string span includes recovered escape");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_EOF, "[1] EOF");
+  ASSERT(diags.count == 2, "UTF-8 escape reports bounded diagnostics");
+  ASSERT(diags.items[0].span.start == 2 && diags.items[0].span.len == 3,
+         "UTF-8 diag spans recovered sequence");
+  ASSERT(diags.items[1].span.start == 1 && diags.items[1].span.len == 4,
+         "escape diag spans full escaped sequence");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 static int test_string_unterminated_eof(void) {
   KavakTokenVec tokens; kavak_token_vec_init(&tokens);
   KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
@@ -1485,6 +1508,7 @@ int main(void) {
   fails += test_string_triple_longest_open();
   fails += test_string_raw_beats_ident_and_skips_escapes();
   fails += test_string_invalid_escape_keeps_token();
+  fails += test_string_invalid_utf8_escape_skips_sequence();
   fails += test_string_unterminated_eof();
   fails += test_string_unterminated_newline_recovers();
   fails += test_template_bare_and_braced_interpolation();
@@ -1494,7 +1518,7 @@ int main(void) {
   fails += test_tinylang_smoke();
 
   if (fails == 0) {
-    printf("  ✓ test_lexer: 51/51 passed\n");
+    printf("  ✓ test_lexer: 52/52 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_lexer: %d failure(s)\n", fails);

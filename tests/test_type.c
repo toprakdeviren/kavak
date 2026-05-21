@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_type.c
  * @brief Type-system toolkit tests.
@@ -93,6 +94,11 @@ static int test_equality(void) {
          "deep equality checks generic argument contents");
   ASSERT(kavak_ty_equal_deep(box_int, box_int2), "deep equality accepts same args");
 
+  KavakTypeInfo *nullable_int = kavak_ty_nullable(&arena, int_ty);
+  KavakTypeInfo *nullable_string = kavak_ty_nullable(&arena, string_ty);
+  ASSERT(!kavak_ty_equal_nominal(nullable_int, nullable_string),
+         "nullable nominal equality checks inner nominal type");
+
   KavakRecordField field_a[] = { { "x", int_ty } };
   KavakRecordField field_b[] = { { "x", string_ty } };
   KavakTypeInfo *record_a = kavak_ty_record(&arena, NULL, 0, field_a, 1);
@@ -118,6 +124,28 @@ static int test_cycle_guards(void) {
   const size_t n = kavak_ty_to_string(&a, buf, sizeof(buf));
   ASSERT(n > 0, "cyclic type string returns length");
   ASSERT(strstr(buf, "<cycle>") != NULL, "cyclic type string marks cycle");
+  return 0;
+}
+
+static int test_wide_type_graph_does_not_trip_depth_guard(void) {
+  enum { FIELD_COUNT = 160 };
+  KavakTypeArena arena;
+  kavak_type_arena_init(&arena);
+
+  KavakTypeInfo *int_ty = kavak_ty_builtin(&arena, KAVAK_TY_INT);
+  KavakTypeInfo *left[FIELD_COUNT];
+  KavakTypeInfo *right[FIELD_COUNT];
+  for (uint32_t i = 0; i < FIELD_COUNT; ++i) {
+    left[i] = kavak_ty_nullable(&arena, int_ty);
+    right[i] = kavak_ty_nullable(&arena, int_ty);
+  }
+
+  KavakTypeInfo *left_record = kavak_ty_record(&arena, left, FIELD_COUNT, NULL, 0);
+  KavakTypeInfo *right_record = kavak_ty_record(&arena, right, FIELD_COUNT, NULL, 0);
+  ASSERT(kavak_ty_equal_deep(left_record, right_record),
+         "wide shallow type graph does not hit depth guard");
+
+  kavak_type_arena_free(&arena);
   return 0;
 }
 
@@ -177,11 +205,12 @@ int main(void) {
   fails += test_constructors_and_to_string();
   fails += test_equality();
   fails += test_cycle_guards();
+  fails += test_wide_type_graph_does_not_trip_depth_guard();
   fails += test_substitution();
   fails += test_session_type_arena();
 
   if (fails == 0) {
-    printf("  ✓ test_type: 6/6 passed\n");
+    printf("  ✓ test_type: 7/7 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_type: %d failure(s)\n", fails);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file tests/test_source.c
  * @brief KavakSource line-offset table + (pos) → (line, col) lookup.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /**
  * @file kavak.h
  * @brief kavak — embeddable frontend toolkit for language implementations.
@@ -198,7 +199,7 @@ typedef enum {
   KAVAK_SEV_NOTE    = 2,
 } KavakSeverity;
 
-/** Library version string ("0.1.0" today). */
+/** Library version string. */
 const char *kavak_version(void);
 
 
@@ -870,7 +871,7 @@ struct KavakRecordField {
 
 struct KavakTypeInfo {
   uint32_t kind;         /* KAVAK_TY_* or KAVAK_TY_USER_BASE+N */
-  uint32_t flags;        /* function flags today; user bits for user kinds */
+  uint32_t flags;        /* function flags; user bits for user kinds */
   union {
     struct {
       KavakTypeInfo *inner;
