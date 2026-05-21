@@ -183,12 +183,12 @@ static void recovery_update_depth(const KavakToken *token, uint32_t *depth) {
     case '(':
     case '[':
     case '{':
-      if (*depth != UINT32_MAX) (*depth)++;
+      if (*depth < UINT32_MAX) (*depth)++;
       break;
     case ')':
     case ']':
     case '}':
-      if (*depth != 0) (*depth)--;
+      if (*depth != 0 && *depth != UINT32_MAX) (*depth)--;
       break;
   }
 }

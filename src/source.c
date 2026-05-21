@@ -4,7 +4,8 @@
  * @brief KavakSource — bytes + line-offset table, (pos)→(line,col).
  *
  * Two-pass init: first counts newlines to size the table, then walks
- * again to fill in offsets. uint32_t offsets cap the source at 4 GiB;
+ * again to fill in offsets. The source layer maps bytes; UTF-8 validity
+ * is reported by the lexer. uint32_t offsets cap the source at 4 GiB;
  * init enforces that cap so spans and line offsets cannot truncate.
  *
  * pos() does a binary search over `line_offsets`, so a 100K-line file
@@ -79,7 +80,7 @@ int kavak_source_init_with_newlines(KavakSource *source,
   for (size_t i = 0; i < len;) {
     const uint32_t n = kavak_source_newline_len(source, i, newline_flags);
     if (n != 0) {
-      if (newlines == UINT32_MAX - 1u) {
+      if (newlines >= UINT32_MAX - 1u) {
         memset(source, 0, sizeof(*source));
         return -1;
       }

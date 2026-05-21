@@ -224,8 +224,9 @@ const char *kavak_version(void);
  *   kavak_source_free(&src);
  *
  * The bytes and filename are borrowed — kavak just stores the pointers,
- * the caller keeps them alive. The line-offset table is owned, freed by
- * kavak_source_free. */
+ * the caller keeps them alive. Source init maps bytes and line starts;
+ * UTF-8 validity is a lexer diagnostic. The line-offset table is owned,
+ * freed by kavak_source_free. */
 
 struct KavakSource {
   const char *bytes;            /**< Source text. Not necessarily NUL-terminated. */
@@ -1217,6 +1218,7 @@ size_t   kavak_diag_format      (const KavakDiag *diag, const KavakSource *sourc
  * (see the forward-decl comment near the top); only the helpers
  * live here. */
 
+/* Sentinel for "no span". Span helpers treat any len==0 range as empty. */
 #define KAVAK_SPAN_NONE ((KavakSpan){ 0, 0 })
 
 KAVAK_INLINE KavakSpan kavak_span_make    (uint32_t start, uint32_t len)      { return (KavakSpan){ start, len }; }

@@ -295,13 +295,13 @@ static uint32_t scan_digits(Lexer *lex, const uint32_t base,
     const unsigned char c = peek(lex);
     if (is_digit_for_base(c, base)) {
       lex->pos++;
-      digit_count++;
+      if (digit_count != UINT32_MAX) digit_count++;
       continue;
     }
     if (c == '_' && (flags & KAVAK_NUM_UNDERSCORES) && digit_count > 0 &&
         byte_at_is_digit_for_base(lex, lex->pos + 1, base)) {
       lex->pos += 2;
-      digit_count++;
+      if (digit_count != UINT32_MAX) digit_count++;
       continue;
     }
     break;
@@ -814,7 +814,7 @@ static int handle_offside_line_start(Lexer *lex) {
   if (col > current) {
     if (lex->indent_top + 1u >= KAVAK_MAX_INDENT_DEPTH) {
       push_diag(lex, kavak_span_make(point, 0), "indentation nesting too deep");
-      return 0;
+      return -1;
     }
     lex->indent_stack[++lex->indent_top] = col;
     return emit_indent_token(lex, KAVAK_TOK_INDENT, point);

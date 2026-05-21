@@ -159,6 +159,19 @@ static KavakRecordField *copy_record_fields(KavakTypeArena *arena,
   return copy;
 }
 
+static int record_fields_valid(KavakTypeInfo *const *positional,
+                               const uint32_t positional_count,
+                               const KavakRecordField *named,
+                               const uint32_t named_count) {
+  for (uint32_t i = 0; i < positional_count; ++i) {
+    if (!positional[i]) return 0;
+  }
+  for (uint32_t i = 0; i < named_count; ++i) {
+    if (!named[i].name || !named[i].type) return 0;
+  }
+  return 1;
+}
+
 KavakTypeInfo *kavak_ty_nullable(KavakTypeArena *arena, KavakTypeInfo *inner) {
   if (!inner) return NULL;
   KavakTypeInfo *type = kavak_ty_alloc(arena, KAVAK_TY_NULLABLE);
@@ -221,6 +234,9 @@ KavakTypeInfo *kavak_ty_record(KavakTypeArena *arena,
                                const KavakRecordField *named,
                                const uint32_t named_count) {
   if ((positional_count != 0 && !positional) || (named_count != 0 && !named)) {
+    return NULL;
+  }
+  if (!record_fields_valid(positional, positional_count, named, named_count)) {
     return NULL;
   }
   KavakTypeInfo **pos_copy = copy_type_array(arena, positional, positional_count);

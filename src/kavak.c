@@ -40,6 +40,8 @@ static int result_init(KavakResult *result, KavakSession *session,
   result->session = session;
   kavak_token_vec_init(&result->tokens);
   kavak_diag_vec_init(&result->diags);
+  /* 64 KiB keeps common ASTs in a small number of chunks without making
+   * empty or tiny analyses reserve much memory. */
   kavak_arena_init(&result->ast_arena, 64u * 1024u);
   if (!result->ast_arena.tail) return -1;
   if (kavak_source_init_with_newlines(&result->source, bytes, len,

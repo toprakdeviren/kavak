@@ -134,14 +134,44 @@ static int test_misaligned_dedent_reports_diag(void) {
   return 0;
 }
 
+static int test_indent_depth_overflow_is_fatal(void) {
+  enum { LEVELS = 130, BUF_SIZE = (LEVELS * (LEVELS + 1)) / 2 + LEVELS * 10 + 1 };
+  char src[BUF_SIZE];
+  size_t pos = 0;
+  for (uint32_t level = 0; level < LEVELS; ++level) {
+    for (uint32_t i = 0; i < level; ++i) src[pos++] = ' ';
+    memcpy(src + pos, "return x\n", 9);
+    pos += 9;
+  }
+  src[pos] = '\0';
+
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex(src, &tokens, &diags) == -1, "deep indent is fatal");
+  int found = 0;
+  for (uint32_t i = 0; i < diags.count; ++i) {
+    if (strcmp(diags.items[i].message, "indentation nesting too deep") == 0) {
+      found = 1;
+      break;
+    }
+  }
+  ASSERT(found, "indent depth diagnostic emitted");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 int main(void) {
   int fails = 0;
   fails += test_python_offside_smoke();
   fails += test_comment_only_line_does_not_indent();
   fails += test_misaligned_dedent_reports_diag();
+  fails += test_indent_depth_overflow_is_fatal();
 
   if (fails == 0) {
-    printf("  ✓ test_lexer_offside: 3/3 passed\n");
+    printf("  ✓ test_lexer_offside: 4/4 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_lexer_offside: %d failure(s)\n", fails);

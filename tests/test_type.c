@@ -75,6 +75,26 @@ static int test_constructors_and_to_string(void) {
   return 0;
 }
 
+static int test_record_rejects_malformed_fields(void) {
+  KavakTypeArena arena;
+  kavak_type_arena_init(&arena);
+
+  KavakTypeInfo *int_ty = kavak_ty_builtin(&arena, KAVAK_TY_INT);
+  KavakTypeInfo *positional[] = { NULL };
+  KavakRecordField no_name[] = { { NULL, int_ty } };
+  KavakRecordField no_type[] = { { "x", NULL } };
+
+  ASSERT(kavak_ty_record(&arena, positional, 1, NULL, 0) == NULL,
+         "record rejects null positional type");
+  ASSERT(kavak_ty_record(&arena, NULL, 0, no_name, 1) == NULL,
+         "record rejects null field name");
+  ASSERT(kavak_ty_record(&arena, NULL, 0, no_type, 1) == NULL,
+         "record rejects null field type");
+
+  kavak_type_arena_free(&arena);
+  return 0;
+}
+
 static int test_equality(void) {
   KavakTypeArena arena;
   kavak_type_arena_init(&arena);
@@ -203,6 +223,7 @@ int main(void) {
   int fails = 0;
   fails += test_builtins();
   fails += test_constructors_and_to_string();
+  fails += test_record_rejects_malformed_fields();
   fails += test_equality();
   fails += test_cycle_guards();
   fails += test_wide_type_graph_does_not_trip_depth_guard();
@@ -210,7 +231,7 @@ int main(void) {
   fails += test_session_type_arena();
 
   if (fails == 0) {
-    printf("  ✓ test_type: 7/7 passed\n");
+    printf("  ✓ test_type: 8/8 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_type: %d failure(s)\n", fails);
