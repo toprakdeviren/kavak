@@ -1,0 +1,17 @@
+build/
+dist/
+node_modules/
+
+*.o
+*.d
+*.a
+*.so
+*.dylib
+
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Landing page (kavak.run) lives at minimobile/web/kavak/, separate repo.
