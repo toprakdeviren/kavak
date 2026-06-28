@@ -74,7 +74,7 @@ static const KavakLexerConfig TINY_LEXER = {
     .flags = KAVAK_NUM_BASE_DEC | KAVAK_NUM_FLOAT | KAVAK_NUM_EXPONENT,
   },
   .strings = TINY_STRINGS,
-  .string_rule_count = sizeof(TINY_STRINGS) / sizeof(*TINY_STRINGS),
+  .string_count = sizeof(TINY_STRINGS) / sizeof(*TINY_STRINGS),
 };
 
 static const KavakParserConfig TINY_PARSER = {
@@ -432,7 +432,7 @@ static void print_token(const KavakSource *source, const KavakToken *token) {
 }
 
 static void print_tokens(const KavakResult *result) {
-  const KavakSource *source = kavak_source(result);
+  const KavakSource *source = kavak_result_source(result);
   const KavakToken *tokens = kavak_tokens(result);
   const size_t count = kavak_token_count(result);
   printf("tokens (%zu):\n", count);
@@ -470,7 +470,7 @@ static int run_case(KavakSession *session, const char *label,
   printf("\n== %s ==\n%s\n", label, code);
   KavakResult *result = kavak_analyze(session, code, label);
   if (!result) {
-    fprintf(stderr, "analysis failed before result creation\n");
+    fprintf(stderr, "analysis failed before result generation\n");
     return 1;
   }
 

@@ -19,9 +19,18 @@
     }                                                                      \
   } while (0)
 
+/* The line-offset table is built lazily on the first position query. These
+ * tests inspect line_count / line_offsets[] directly, so they touch the table
+ * once (via the documented accessor) to force the build before asserting. */
+static void build_lines(KavakSource *s) {
+  uint32_t line = 0, col = 0;
+  kavak_source_pos(s, 0, &line, &col);
+}
+
 static int test_empty(void) {
   KavakSource source;
   ASSERT(kavak_source_init(&source, "", 0, "empty.kv") == 0, "init empty: ok");
+  build_lines(&source);
   ASSERT(source.line_count == 1, "empty: 1 logical line");
   ASSERT(source.line_offsets[0] == 0, "empty: line 1 starts at 0");
   ASSERT(source.line_offsets[1] == 0, "empty: sentinel = len = 0");
@@ -36,6 +45,7 @@ static int test_single_line(void) {
   const char *src = "hello";
   KavakSource source;
   kavak_source_init(&source, src, strlen(src), "one.kv");
+  build_lines(&source);
   ASSERT(source.line_count == 1, "single: 1 line");
   ASSERT(source.line_offsets[0] == 0, "single: starts at 0");
   ASSERT(source.line_offsets[1] == 5, "single: sentinel = 5");
@@ -56,6 +66,7 @@ static int test_multi_line(void) {
   const char *src = "abc\nde\nfgh";
   KavakSource source;
   kavak_source_init(&source, src, strlen(src), "multi.kv");
+  build_lines(&source);
   ASSERT(source.line_count == 3, "multi: 3 lines");
   ASSERT(source.line_offsets[0] == 0, "line 1 starts at 0");
   ASSERT(source.line_offsets[1] == 4, "line 2 starts after \\n at 4");
@@ -80,6 +91,7 @@ static int test_default_newline_policy(void) {
   KavakSource source;
   ASSERT(kavak_source_init(&source, src, strlen(src), "newlines.kv") == 0,
          "init mixed physical newlines");
+  build_lines(&source);
   ASSERT(source.newline_flags == KAVAK_NEWLINE_DEFAULT, "default newline policy stored");
   ASSERT(source.line_count == 4, "CR, CRLF, LF count as physical newlines");
   ASSERT(source.line_offsets[0] == 0, "line 1 starts at 0");
@@ -103,6 +115,7 @@ static int test_unicode_newline_policy(void) {
                                          KAVAK_NEWLINE_DEFAULT |
                                          KAVAK_NEWLINE_UNICODE) == 0,
          "init Unicode physical newlines");
+  build_lines(&source);
   ASSERT(source.line_count == 3, "LS and NEL count as physical newlines");
   ASSERT(source.line_offsets[0] == 0, "line 1 starts at 0");
   ASSERT(source.line_offsets[1] == 4, "line 2 starts after U+2028");
@@ -127,6 +140,7 @@ static int test_trailing_newline(void) {
   const char *src = "abc\n";
   KavakSource source;
   kavak_source_init(&source, src, strlen(src), "trail.kv");
+  build_lines(&source);
   ASSERT(source.line_count == 2, "trailing-\\n source has 2 logical lines");
   ASSERT(source.line_offsets[1] == 4, "line 2 starts at 4 (just past EOF)");
   ASSERT(source.line_offsets[2] == 4, "sentinel = len = 4");
@@ -167,6 +181,32 @@ static int test_rejects_invalid_inputs(void) {
   return 0;
 }
 
+static int test_slice(void) {
+  const char *text = "hello world";
+  KavakSource source;
+  ASSERT(kavak_source_init(&source, text, 11, "<slice>") == 0, "source init");
+
+  size_t len = 0;
+  const char *p = kavak_source_slice(&source, kavak_span_make(6, 5), &len);
+  ASSERT(p && len == 5 && memcmp(p, "world", 5) == 0, "slice returns the span bytes");
+  ASSERT(p == text + 6, "slice borrows into the source buffer");
+
+  p = kavak_source_slice(&source, kavak_span_make(6, 999), &len);
+  ASSERT(p && len == 5, "over-long span clamps to available bytes");
+
+  p = kavak_source_slice(&source, kavak_span_make(0, 0), &len);
+  ASSERT(p == text && len == 0, "empty span yields a valid pointer, zero length");
+
+  p = kavak_source_slice(&source, kavak_span_make(11, 1), &len);
+  ASSERT(p == NULL && len == 0, "span starting at the end is NULL");
+
+  ASSERT(kavak_source_slice(NULL, kavak_span_make(0, 1), &len) == NULL,
+         "NULL source yields NULL");
+
+  kavak_source_free(&source);
+  return 0;
+}
+
 int main(void) {
   int fails = 0;
   fails += test_empty();
@@ -177,9 +217,10 @@ int main(void) {
   fails += test_trailing_newline();
   fails += test_filename_borrow();
   fails += test_rejects_invalid_inputs();
+  fails += test_slice();
 
   if (fails == 0) {
-    printf("  ✓ test_source: 8/8 passed\n");
+    printf("  ✓ test_source: 9/9 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_source: %d failure(s)\n", fails);

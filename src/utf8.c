@@ -2,23 +2,25 @@
 /**
  * @file src/utf8.c
  * @brief UTF-8 decoding and identifier predicates.
+ *
+ * Self-contained: codepoint classification uses kavak's own XID tables
+ * (src/unicode_xid.c, generated from the Unicode Character Database), and the
+ * UTF-8 decoder is a small standards-conformant scalar routine. No external
+ * Unicode library is required.
  */
 
 #include "kavak.h"
+#include "kavak_internal.h"
 
-#include <kavak_decoder/core.h>
-#include <kavak_decoder/encoding.h>
-#include <kavak_decoder/security.h>
+#include "unicode_xid.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 void kavak_utf8_init(void) {
-  decoder_init();
-}
-
-static void kavak_decoder_ensure_init(void) {
-  kavak_utf8_init();
+  /* No initialization required: the XID tables are static const data and the
+   * decoder is stateless. Kept as a stable no-op so callers (kavak.c) need not
+   * change. */
 }
 
 static int utf8_lead_len(const unsigned char lead) {
@@ -35,13 +37,22 @@ int kavak_utf8_decode(const char *p, const char *end, uint32_t *out_cp) {
   const int len = utf8_lead_len(lead);
   if (len == 0 || (size_t)(end - p) < (size_t)len) return 0;
 
-  kavak_decoder_ensure_init();
+  /* Strip the leading-byte tag bits; widths: 1→7, 2→5, 3→4, 4→3 payload bits. */
+  static const unsigned char lead_mask[5] = { 0, 0x7F, 0x1F, 0x0F, 0x07 };
+  uint32_t cp = (uint32_t)(lead & lead_mask[len]);
 
-  uint32_t cp = 0;
-  size_t written = 0;
-  const int rc = decoder_utf8_to_utf32((const uint8_t *)p, (size_t)len,
-                                       &cp, 1u, &written);
-  if (rc != 0 || written != 1u) return 0;
+  for (int i = 1; i < len; i++) {
+    const unsigned char cont = (unsigned char)p[i];
+    if ((cont & 0xC0) != 0x80) return 0; /* not a 10xxxxxx continuation byte */
+    cp = (cp << 6) | (uint32_t)(cont & 0x3F);
+  }
+
+  /* Reject overlong encodings, UTF-16 surrogates, and out-of-range scalars.
+   * (utf8_lead_len already rejects the 0xC0/0xC1 2-byte overlong leads.) */
+  static const uint32_t min_cp[5] = { 0, 0, 0x80, 0x800, 0x10000 };
+  if (cp < min_cp[len]) return 0;             /* overlong */
+  if (cp > 0x10FFFF) return 0;                /* beyond Unicode */
+  if (cp >= 0xD800 && cp <= 0xDFFF) return 0; /* lone surrogate */
 
   if (out_cp) *out_cp = cp;
   return len;
@@ -60,11 +71,13 @@ int kavak_ascii_is_ident_cont(uint32_t cp) {
 }
 
 int kavak_unicode_is_ident_start(uint32_t cp) {
-  kavak_decoder_ensure_init();
-  return cp == '_' || decoder_is_identifier_start(cp);
+  /* ASCII fast path covers the overwhelmingly common case without a search.
+   * '_' is XID_Continue (Pc), not XID_Start, so kavak admits it explicitly. */
+  if (cp < 0x80) return kavak_ascii_is_ident_start(cp);
+  return kavak_xid_is_start(cp);
 }
 
 int kavak_unicode_is_ident_cont(uint32_t cp) {
-  kavak_decoder_ensure_init();
-  return cp == '_' || decoder_is_identifier_continue(cp);
+  if (cp < 0x80) return kavak_ascii_is_ident_cont(cp);
+  return kavak_xid_is_continue(cp);
 }

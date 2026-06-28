@@ -27,6 +27,7 @@
  *   - unterminated block comment → INVALID + diag at EOF
  *   - same bytes, nest off vs on → clean close vs unterminated
  *   - doc comment ("///" beats "//") emitted iff keep_doc_comments
+ *   - keep_comments retains every style as COMMENT; errors stay INVALID
  *
  * OPERATORS:
  *   - single operator → OP (v = op_id)
@@ -41,6 +42,8 @@
  *   - underscores only between digits
  *   - decimal floats + e/E exponents
  *   - malformed resync (`1.2.3`, `0x`) and longest-match suffix consumption
+ *   - underscore runs between digits (`1__2`); trailing `_` resyncs
+ *   - leading-dot floats (`.5`, `.5e3`) behind KAVAK_NUM_LEADING_DOT
  *
  * STRINGS:
  *   - normal strings validate configured escapes
@@ -49,11 +52,19 @@
  *   - raw string open beats identifier scanning and skips escapes
  *   - invalid escape reports a diag but still emits STRING
  *   - unterminated strings emit INVALID and recover
+ *   - IDENT-flagged rules emit quoted identifiers (backticks), no
+ *     keyword retag, string-style unterminated recovery
  *
  * INTERPOLATION + AUTO-SEMI:
  *   - template strings emit STRING fragments around bare `$name`
  *     and braced `${expr}` tokens
  *   - braced interpolation balances inner braces
+ *   - lone `$` (no ident/brace after) is literal text in dual-form
+ *     rules; explicit-close rules always enter the expression
+ *   - marker kinds remap fragments (head/interior/tail v-tags), `${`,
+ *     `}`, and `$ident` entries onto user token kinds
+ *   - emit_newlines yields a NEWLINE per physical newline — blank
+ *     lines and `${...}` holes included, comments and EOF excluded
  *   - Go-style auto-semi emits configured virtual semicolons before
  *     newline / EOF after terminating token kinds
  *
@@ -91,6 +102,20 @@ static const KavakKeyword KW_TABLE[] = {
 static const KavakLexerConfig KW_CONFIG = {
   .keywords      = KW_TABLE,
   .keyword_count = sizeof(KW_TABLE) / sizeof(*KW_TABLE),
+};
+
+/* Soft (contextual) keywords: id 2 ("soft") is listed in soft_keywords, so it
+ * lexes as IDENT carrying its id; id 1 ("hard") retags to KEYWORD as usual. */
+static const KavakKeyword SOFT_KW_TABLE[] = {
+  { "hard", 1 },
+  { "soft", 2 },
+};
+static const uint32_t SOFT_KW_IDS[] = { 2 };
+static const KavakLexerConfig SOFT_KW_CONFIG = {
+  .keywords           = SOFT_KW_TABLE,
+  .keyword_count      = sizeof(SOFT_KW_TABLE) / sizeof(*SOFT_KW_TABLE),
+  .soft_keywords      = SOFT_KW_IDS,
+  .soft_keyword_count = sizeof(SOFT_KW_IDS) / sizeof(*SOFT_KW_IDS),
 };
 
 /* Custom ident predicates that admit '$' — proves the hook is dispatched
@@ -152,6 +177,13 @@ static const KavakLexerConfig CMT_DOC_SKIP = {
   .keep_doc_comments = 0,
 };
 
+/* keep_comments retains EVERY comment style, doc or not. */
+static const KavakLexerConfig CMT_KEEP_ALL = {
+  .comments      = CMT_RULES,
+  .comment_count = sizeof(CMT_RULES) / sizeof(*CMT_RULES),
+  .keep_comments = 1,
+};
+
 /* Operator table. Listed shortest-first on purpose: a naive
  * first-match scan would stop at "<" / "=", so passing the longest-match
  * tests proves table order does not affect matching. "\xE2\x89\xA0" is "≠"
@@ -183,6 +215,12 @@ static const KavakLexerConfig NUM_BASE_CONFIG = {
              KAVAK_NUM_UNDERSCORES,
   },
 };
+static const KavakLexerConfig NUM_STRICT_CONFIG = {
+  .numbers = {
+    .flags = KAVAK_NUM_BASE_DEC | KAVAK_NUM_BASE_HEX |
+             KAVAK_NUM_STRICT_INVALID_DIGITS,
+  },
+};
 static const KavakLexerConfig NUM_FLOAT_CONFIG = {
   .numbers = {
     .flags = KAVAK_NUM_BASE_DEC | KAVAK_NUM_FLOAT |
@@ -204,6 +242,36 @@ static const KavakLexerConfig NUM_SUFFIX_UNSORTED_CONFIG = {
     .suffixes     = NUM_SUFFIXES_UNSORTED,
     .suffix_count = sizeof(NUM_SUFFIXES_UNSORTED) / sizeof(*NUM_SUFFIXES_UNSORTED),
   },
+};
+static const char *const NUM_SUFFIXES_U[] = { "u" };
+static const KavakLexerConfig NUM_SUFFIX_BOUNDARY_CONFIG = {
+  .numbers = {
+    .flags        = KAVAK_NUM_BASE_DEC | KAVAK_NUM_SUFFIX_REQUIRES_BOUNDARY,
+    .suffixes     = NUM_SUFFIXES_U,
+    .suffix_count = sizeof(NUM_SUFFIXES_U) / sizeof(*NUM_SUFFIXES_U),
+  },
+};
+static const KavakLexerConfig NUM_SUFFIX_BOUNDARY_CONFIG_OFF = {
+  .numbers = {
+    .flags        = KAVAK_NUM_BASE_DEC,  /* same suffix, no boundary flag */
+    .suffixes     = NUM_SUFFIXES_U,
+    .suffix_count = sizeof(NUM_SUFFIXES_U) / sizeof(*NUM_SUFFIXES_U),
+  },
+};
+
+/* Leading-dot floats plus a `..` range operator — the first dot of `..`
+ * is not followed by a digit, so the operator table still claims it. */
+enum { OP_RANGE = 21 };
+static const KavakOperator RANGE_OPS[] = {
+  { "..", 10, KAVAK_ASSOC_LEFT, KAVAK_OP_FLAG_INFIX, OP_RANGE },
+};
+static const KavakLexerConfig NUM_LEADING_DOT_CONFIG = {
+  .numbers = {
+    .flags = KAVAK_NUM_BASE_DEC | KAVAK_NUM_FLOAT |
+             KAVAK_NUM_EXPONENT | KAVAK_NUM_LEADING_DOT,
+  },
+  .operators      = RANGE_OPS,
+  .operator_count = sizeof(RANGE_OPS) / sizeof(*RANGE_OPS),
 };
 
 /* String rules. The plain quote rule intentionally appears
@@ -239,7 +307,22 @@ static const KavakStringRule STR_RULES[] = {
 };
 static const KavakLexerConfig STR_CONFIG = {
   .strings           = STR_RULES,
-  .string_rule_count = sizeof(STR_RULES) / sizeof(*STR_RULES),
+  .string_count = sizeof(STR_RULES) / sizeof(*STR_RULES),
+};
+
+/* Backtick quoted-identifier rule (Kotlin-style). RAW keeps `\` a plain
+ * byte; the keyword table proves quoted names never retag. */
+static const KavakStringRule QUOTED_IDENT_RULES[] = {
+  {
+    .open = "`", .close = "`",
+    .flags = KAVAK_STR_FLAG_IDENT | KAVAK_STR_FLAG_RAW,
+  },
+};
+static const KavakLexerConfig QUOTED_IDENT_CONFIG = {
+  .keywords          = KW_TABLE,
+  .keyword_count     = sizeof(KW_TABLE) / sizeof(*KW_TABLE),
+  .strings           = QUOTED_IDENT_RULES,
+  .string_count = sizeof(QUOTED_IDENT_RULES) / sizeof(*QUOTED_IDENT_RULES),
 };
 
 static const KavakStringRule TEMPLATE_RULES[] = {
@@ -257,9 +340,65 @@ static const KavakOperator TEMPLATE_OPS[] = {
 };
 static const KavakLexerConfig TEMPLATE_CONFIG = {
   .strings           = TEMPLATE_RULES,
-  .string_rule_count = sizeof(TEMPLATE_RULES) / sizeof(*TEMPLATE_RULES),
+  .string_count = sizeof(TEMPLATE_RULES) / sizeof(*TEMPLATE_RULES),
   .operators         = TEMPLATE_OPS,
   .operator_count    = sizeof(TEMPLATE_OPS) / sizeof(*TEMPLATE_OPS),
+};
+
+/* Kotlin-shaped marker remapping: fragments and interpolation markers
+ * land on user kinds so a parser can rebuild template structure. */
+enum {
+  MARK_FRAGMENT     = KAVAK_TOK_USER_BASE + 1,
+  MARK_INTERP_OPEN  = KAVAK_TOK_USER_BASE + 2,
+  MARK_INTERP_CLOSE = KAVAK_TOK_USER_BASE + 3,
+  MARK_BARE_IDENT   = KAVAK_TOK_USER_BASE + 4,
+};
+static const KavakStringRule MARKER_TEMPLATE_RULES[] = {
+  {
+    .open = "\"", .close = "\"",
+    .flags = KAVAK_STR_FLAG_TEMPLATE,
+    .interp_open = "$",
+    .interp_close = NULL,
+    .escapes = STR_ESCAPES,
+    .escape_count = sizeof(STR_ESCAPES) / sizeof(*STR_ESCAPES),
+    .fragment_kind     = MARK_FRAGMENT,
+    .interp_open_kind  = MARK_INTERP_OPEN,
+    .interp_close_kind = MARK_INTERP_CLOSE,
+    .bare_ident_kind   = MARK_BARE_IDENT,
+  },
+};
+static const KavakLexerConfig MARKER_TEMPLATE_CONFIG = {
+  .strings           = MARKER_TEMPLATE_RULES,
+  .string_count = sizeof(MARKER_TEMPLATE_RULES) / sizeof(*MARKER_TEMPLATE_RULES),
+  .operators         = TEMPLATE_OPS,
+  .operator_count    = sizeof(TEMPLATE_OPS) / sizeof(*TEMPLATE_OPS),
+};
+
+/* Swift-style explicit-close interpolation — `\(expr)` always enters
+ * the expression, whatever follows the marker. */
+static const KavakStringRule SWIFT_TEMPLATE_RULES[] = {
+  {
+    .open = "\"", .close = "\"",
+    .flags = KAVAK_STR_FLAG_TEMPLATE,
+    .interp_open = "\\(",
+    .interp_close = ")",
+  },
+};
+static const KavakLexerConfig SWIFT_TEMPLATE_CONFIG = {
+  .strings           = SWIFT_TEMPLATE_RULES,
+  .string_count = sizeof(SWIFT_TEMPLATE_RULES) / sizeof(*SWIFT_TEMPLATE_RULES),
+};
+
+/* emit_newlines without offside/auto_semi: every physical newline emits
+ * a NEWLINE token, including inside `${...}` holes. */
+static const KavakLexerConfig EMIT_NEWLINES_CONFIG = {
+  .strings           = TEMPLATE_RULES,
+  .string_count = sizeof(TEMPLATE_RULES) / sizeof(*TEMPLATE_RULES),
+  .operators         = TEMPLATE_OPS,
+  .operator_count    = sizeof(TEMPLATE_OPS) / sizeof(*TEMPLATE_OPS),
+  .comments          = CMT_RULES,
+  .comment_count     = sizeof(CMT_RULES) / sizeof(*CMT_RULES),
+  .emit_newlines     = 1,
 };
 
 enum { PUNCT_VIRTUAL_SEMI = 99 };
@@ -315,7 +454,7 @@ static const KavakLexerConfig TINY_CONFIG = {
              KAVAK_NUM_EXPONENT | KAVAK_NUM_UNDERSCORES,
   },
   .strings           = STR_RULES,
-  .string_rule_count = sizeof(STR_RULES) / sizeof(*STR_RULES),
+  .string_count = sizeof(STR_RULES) / sizeof(*STR_RULES),
 };
 
 static int run_lex_with(const KavakLexerConfig *config, const char *bytes,
@@ -369,6 +508,18 @@ static int test_invalid_config_rejected(void) {
   };
   ASSERT(run_lex_with(&bad_operator, "+", &tokens, &diags) == -1,
          "empty operator spelling rejected");
+
+  /* soft_keyword_count > 0 with a NULL table: the identifier retagger would
+   * dereference soft_keywords[j] when "let" matches a keyword. Validation must
+   * reject the config up front instead of crashing. */
+  const KavakLexerConfig bad_soft_keywords = {
+    .keywords           = KW_TABLE,
+    .keyword_count      = sizeof(KW_TABLE) / sizeof(*KW_TABLE),
+    .soft_keywords      = NULL,
+    .soft_keyword_count = 1,
+  };
+  ASSERT(run_lex_with(&bad_soft_keywords, "let", &tokens, &diags) == -1,
+         "soft_keyword_count>0 with NULL table rejected");
 
   kavak_diag_vec_free(&diags);
   kavak_token_vec_free(&tokens);
@@ -481,6 +632,28 @@ static int test_keyword_match(void) {
   ASSERT(tokens.items[2].kind == KAVAK_TOK_IDENT, "[2] IDENT (foo)");
   ASSERT(tokens.items[2].v == 0, "[2] IDENT v = 0");
   ASSERT(tokens.items[3].kind == KAVAK_TOK_EOF, "[3] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_soft_keyword(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex_with(&SOFT_KW_CONFIG, "hard soft other", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 4, "KEYWORD IDENT IDENT EOF");
+  /* Hard keyword retags to KEYWORD as usual. */
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_KEYWORD, "[0] hard => KEYWORD");
+  ASSERT(kavak_token_keyword_id(&tokens.items[0]) == 1, "[0] keyword id");
+  /* Soft keyword stays IDENT but carries its id for contextual parsing. */
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT, "[1] soft => IDENT");
+  ASSERT(kavak_token_soft_keyword_id(&tokens.items[1]) == 2, "[1] soft id carried");
+  /* A plain identifier is IDENT with no soft id. */
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_IDENT, "[2] other => IDENT");
+  ASSERT(kavak_token_soft_keyword_id(&tokens.items[2]) == 0, "[2] no soft id");
   ASSERT(diags.count == 0, "no diags");
 
   kavak_diag_vec_free(&diags);
@@ -778,6 +951,45 @@ static int test_doc_comment_skipped(void) {
   return 0;
 }
 
+static int test_keep_comments(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* keep_comments retains non-doc line AND block comments as COMMENT
+   * tokens; the line comment still excludes its terminating newline. */
+  ASSERT(run_lex_with(&CMT_KEEP_ALL, "// c\nx /* b */", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 4, "COMMENT IDENT COMMENT EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_COMMENT, "[0] line COMMENT");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] spans \"// c\", not the newline");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT, "[1] IDENT x");
+  ASSERT(tokens.items[1].span.start == 5 && tokens.items[1].span.len == 1,
+         "[1] x after the newline");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_COMMENT, "[2] block COMMENT");
+  ASSERT(tokens.items[2].span.start == 7 && tokens.items[2].span.len == 7,
+         "[2] spans open through close delimiter");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_EOF, "[3] EOF");
+  ASSERT(diags.count == 0, "kept comments produce no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* An unterminated block comment is still an error, not trivia. */
+  ASSERT(run_lex_with(&CMT_KEEP_ALL, "/* x", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "INVALID + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INVALID,
+         "[0] unterminated block stays INVALID under keep_comments");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] INVALID spans the run");
+  ASSERT(diags.count == 1, "one diag for the unterminated comment");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 /* ── Operator + punctuation tests ────────────────────────────────────── */
 
 static int test_operator_single(void) {
@@ -1010,19 +1222,18 @@ static int test_number_underscore_boundaries(void) {
   KavakTokenVec tokens; kavak_token_vec_init(&tokens);
   KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
 
+  /* Underscore runs between digits are legal Java/Kotlin separators, so
+   * `1__2` is ONE literal; only a trailing run stops the number. */
   ASSERT(run_lex_with(&NUM_BASE_CONFIG, "1_234 1__2", &tokens, &diags) == 0, "rc 0");
-  ASSERT(tokens.count == 4, "INT INT IDENT EOF");
+  ASSERT(tokens.count == 3, "INT INT EOF");
   ASSERT(tokens.items[0].kind == KAVAK_TOK_INT, "[0] INT 1_234");
   ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 5,
          "[0] underscore between digits is accepted");
-  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT, "[1] INT 1");
-  ASSERT(tokens.items[1].span.start == 6 && tokens.items[1].span.len == 1,
-         "[1] second number stops before bad separator");
-  ASSERT(tokens.items[2].kind == KAVAK_TOK_IDENT, "[2] IDENT __2");
-  ASSERT(tokens.items[2].span.start == 7 && tokens.items[2].span.len == 3,
-         "[2] bad separator resyncs as an identifier");
-  ASSERT(tokens.items[3].kind == KAVAK_TOK_EOF, "[3] EOF");
-  ASSERT(diags.count == 0, "bad separator after a valid prefix is resync, not INVALID");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT, "[1] INT 1__2");
+  ASSERT(tokens.items[1].span.start == 6 && tokens.items[1].span.len == 4,
+         "[1] double underscore between digits is one literal");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_EOF, "[2] EOF");
+  ASSERT(diags.count == 0, "underscore runs between digits are not errors");
 
   kavak_diag_vec_free(&diags);
   kavak_token_vec_free(&tokens);
@@ -1088,6 +1299,86 @@ static int test_number_malformed_resync(void) {
   return 0;
 }
 
+static int test_number_strict_invalid_digits(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Strict: "0x1g" is one malformed token, not INT 0x1 + IDENT g. */
+  ASSERT(run_lex_with(&NUM_STRICT_CONFIG, "0x1g", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "INVALID + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INVALID, "[0] INVALID");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] malformed token spans the whole '0x1g'");
+  ASSERT(diags.count == 1 &&
+         strcmp(diags.items[0].message, "malformed number literal") == 0,
+         "malformed number literal diagnostic");
+
+  kavak_token_vec_free(&tokens); kavak_token_vec_init(&tokens);
+  kavak_diag_vec_free(&diags);   kavak_diag_vec_init(&diags);
+
+  /* Strict: a decimal that runs into letters is malformed too. */
+  ASSERT(run_lex_with(&NUM_STRICT_CONFIG, "12abc", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INVALID &&
+         tokens.items[0].span.start == 0 && tokens.items[0].span.len == 5,
+         "'12abc' is one malformed token");
+
+  kavak_token_vec_free(&tokens); kavak_token_vec_init(&tokens);
+  kavak_diag_vec_free(&diags);   kavak_diag_vec_init(&diags);
+
+  /* Clean literals are still fine; whitespace is a valid boundary. */
+  ASSERT(run_lex_with(&NUM_STRICT_CONFIG, "0x1f 12", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INT &&
+         tokens.items[0].span.len == 4, "[0] 0x1f INT");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT &&
+         tokens.items[1].span.start == 5 && tokens.items[1].span.len == 2,
+         "[1] 12 INT");
+  ASSERT(diags.count == 0, "no diags for clean literals under strict mode");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_hex_escape_helper(void) {
+  uint32_t cp = 0;
+#define HX(str, form) kavak_scan_hex_escape((str), (str) + strlen(str), (form), &cp)
+
+  /* \xHH — exactly two hex digits, a raw byte. */
+  ASSERT(HX("41", 'x') == 2 && cp == 0x41, "\\x41 => 'A', 2 bytes");
+  ASSERT(HX("ff", 'x') == 2 && cp == 0xFF, "\\xff => 0xFF");
+  ASSERT(HX("4", 'x') == 0, "\\x with one digit is malformed");
+  ASSERT(HX("4g", 'x') == 0, "\\x with a non-hex digit is malformed");
+
+  /* \uHHHH — exactly four hex digits, a Unicode scalar. */
+  ASSERT(HX("0041", 'u') == 4 && cp == 0x41, "\\u0041 => 'A'");
+  ASSERT(HX("00G0", 'u') == 0, "\\u with bad hex is malformed");
+  ASSERT(HX("004", 'u') == 0, "\\u with three digits is malformed");
+  ASSERT(HX("d800", 'u') == 0, "\\u surrogate is rejected");
+
+  /* \u{H+} — 1..6 hex digits in braces. */
+  ASSERT(HX("{1F600}", 'u') == 7 && cp == 0x1F600, "\\u{1F600} => emoji, 7 bytes");
+  ASSERT(HX("{41}", 'u') == 4 && cp == 0x41, "\\u{41} => 'A', 4 bytes");
+  ASSERT(HX("{10FFFF}", 'u') == 8 && cp == 0x10FFFF, "\\u{10FFFF} max scalar");
+  ASSERT(HX("{}", 'u') == 0, "\\u{} empty is malformed");
+  ASSERT(HX("{110000}", 'u') == 0, "\\u{110000} is out of range");
+  ASSERT(HX("{D800}", 'u') == 0, "\\u{D800} surrogate is rejected");
+  ASSERT(HX("{1F600", 'u') == 0, "\\u{ unclosed brace is malformed");
+  ASSERT(HX("{1234567}", 'u') == 0, "\\u{ too many digits is malformed");
+
+  /* \UHHHHHHHH — exactly eight hex digits, a Unicode scalar. */
+  ASSERT(HX("0001F600", 'U') == 8 && cp == 0x1F600, "\\U0001F600 => emoji");
+  ASSERT(HX("00110000", 'U') == 0, "\\U is out of range");
+  ASSERT(HX("0000D800", 'U') == 0, "\\U surrogate is rejected");
+
+  /* Unrecognized form and degenerate inputs. */
+  ASSERT(HX("41", 'z') == 0, "unknown form => 0");
+  ASSERT(kavak_scan_hex_escape("", "", 'x', &cp) == 0, "empty payload => 0");
+  ASSERT(kavak_scan_hex_escape(NULL, NULL, 'x', &cp) == 0, "NULL payload => 0");
+
+#undef HX
+  return 0;
+}
+
 static int test_number_invalid_prefixed_literal(void) {
   KavakTokenVec tokens; kavak_token_vec_init(&tokens);
   KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
@@ -1127,6 +1418,50 @@ static int test_number_suffixes(void) {
   return 0;
 }
 
+static int test_number_suffix_boundary(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Flag OFF (default longest-match): "123usize" splits into 123u + size. */
+  ASSERT(run_lex_with(&NUM_SUFFIX_BOUNDARY_CONFIG_OFF, "123usize", &tokens, &diags) == 0,
+         "rc 0 (boundary off)");
+  ASSERT(tokens.count == 3, "INT IDENT EOF (off)");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INT &&
+         tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] 123u — suffix consumed without boundary (off)");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT &&
+         tokens.items[1].span.start == 4 && tokens.items[1].span.len == 4,
+         "[1] 'size' (off)");
+
+  kavak_token_vec_free(&tokens); kavak_token_vec_init(&tokens);
+  kavak_diag_vec_free(&diags);   kavak_diag_vec_init(&diags);
+
+  /* Flag ON: "123usize" stays 123 + usize (suffix needs a boundary). */
+  ASSERT(run_lex_with(&NUM_SUFFIX_BOUNDARY_CONFIG, "123usize", &tokens, &diags) == 0,
+         "rc 0 (boundary on)");
+  ASSERT(tokens.count == 3, "INT IDENT EOF (on)");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INT &&
+         tokens.items[0].span.start == 0 && tokens.items[0].span.len == 3,
+         "[0] 123 — suffix rejected at identifier boundary (on)");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT &&
+         tokens.items[1].span.start == 3 && tokens.items[1].span.len == 5,
+         "[1] 'usize' (on)");
+
+  kavak_token_vec_free(&tokens); kavak_token_vec_init(&tokens);
+  kavak_diag_vec_free(&diags);   kavak_diag_vec_init(&diags);
+
+  /* Flag ON, real boundary: "123u;" still takes the suffix (';' ends it). */
+  ASSERT(run_lex_with(&NUM_SUFFIX_BOUNDARY_CONFIG, "123u", &tokens, &diags) == 0,
+         "rc 0 (on, clean)");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INT &&
+         tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] 123u — suffix consumed at EOF boundary (on)");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 static int test_number_suffix_longest_unsorted(void) {
   KavakTokenVec tokens; kavak_token_vec_init(&tokens);
   KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
@@ -1138,6 +1473,81 @@ static int test_number_suffix_longest_unsorted(void) {
   ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
          "longest suffix wins even when table is unsorted");
   ASSERT(tokens.items[1].kind == KAVAK_TOK_EOF, "[1] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_number_leading_dot(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* `.5` becomes a FLOAT starting at the dot; a dot NOT followed by a
+   * digit is untouched, so `..` stays an operator and `.x` stays
+   * punct + ident. One fraction per literal: `.5.6` is two FLOATs. */
+  ASSERT(run_lex_with(&NUM_LEADING_DOT_CONFIG, ".5 1..2 .x .5.6 .5e3",
+                      &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 10, "FLOAT INT OP INT PUNCT IDENT FLOAT FLOAT FLOAT EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_FLOAT, "[0] FLOAT .5");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 2,
+         "[0] spans .5 including the dot");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT, "[1] INT 1");
+  ASSERT(tokens.items[1].span.start == 3 && tokens.items[1].span.len == 1,
+         "[1] no fraction: next byte after . is another .");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_OP && tokens.items[2].v == OP_RANGE,
+         "[2] .. claimed by the operator table");
+  ASSERT(tokens.items[2].span.start == 4 && tokens.items[2].span.len == 2,
+         "[2] spans both dots");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_INT, "[3] INT 2");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_PUNCT && tokens.items[4].v == '.',
+         "[4] .x keeps the dot as punct");
+  ASSERT(tokens.items[4].span.start == 8 && tokens.items[4].span.len == 1,
+         "[4] one byte");
+  ASSERT(tokens.items[5].kind == KAVAK_TOK_IDENT, "[5] IDENT x");
+  ASSERT(tokens.items[6].kind == KAVAK_TOK_FLOAT, "[6] FLOAT .5");
+  ASSERT(tokens.items[6].span.start == 11 && tokens.items[6].span.len == 2,
+         "[6] first fraction stops before the second dot");
+  ASSERT(tokens.items[7].kind == KAVAK_TOK_FLOAT, "[7] FLOAT .6");
+  ASSERT(tokens.items[7].span.start == 13 && tokens.items[7].span.len == 2,
+         "[7] second leading-dot float");
+  ASSERT(tokens.items[8].kind == KAVAK_TOK_FLOAT, "[8] FLOAT .5e3");
+  ASSERT(tokens.items[8].span.start == 16 && tokens.items[8].span.len == 4,
+         "[8] exponent rides on a leading-dot float");
+  ASSERT(tokens.items[9].kind == KAVAK_TOK_EOF, "[9] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_number_underscore_runs(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* A `_` run between digits is consumed whole (any length, any base);
+   * a trailing run stops the number before the first underscore. */
+  ASSERT(run_lex_with(&NUM_BASE_CONFIG, "1__2 1_ 1_000 0x1__f", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 6, "INT INT IDENT INT INT EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INT, "[0] INT 1__2");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] double underscore run is one literal");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT, "[1] INT 1");
+  ASSERT(tokens.items[1].span.start == 5 && tokens.items[1].span.len == 1,
+         "[1] trailing underscore is not consumed");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_IDENT, "[2] IDENT _");
+  ASSERT(tokens.items[2].span.start == 6 && tokens.items[2].span.len == 1,
+         "[2] the trailing underscore resyncs as an ident");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_INT, "[3] INT 1_000");
+  ASSERT(tokens.items[3].span.start == 8 && tokens.items[3].span.len == 5,
+         "[3] single separators unchanged");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_INT, "[4] INT 0x1__f");
+  ASSERT(tokens.items[4].span.start == 14 && tokens.items[4].span.len == 6,
+         "[4] runs work for non-decimal bases too");
+  ASSERT(tokens.items[5].kind == KAVAK_TOK_EOF, "[5] EOF");
   ASSERT(diags.count == 0, "no diags");
 
   kavak_diag_vec_free(&diags);
@@ -1296,6 +1706,53 @@ static int test_string_unterminated_newline_recovers(void) {
   return 0;
 }
 
+static int test_string_quoted_identifier(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* The IDENT flag emits a quoted identifier spanning both backticks.
+   * "if" is in the keyword table, but quoted names never retag. */
+  ASSERT(run_lex_with(&QUOTED_IDENT_CONFIG, "`if`", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "IDENT + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_IDENT, "[0] IDENT, not KEYWORD");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] spans both delimiters");
+  ASSERT(tokens.items[0].v == 0, "[0] IDENT v = 0");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_EOF, "[1] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* Empty backticks stay a legal 2-byte IDENT — validation is the
+   * consumer's job. */
+  ASSERT(run_lex_with(&QUOTED_IDENT_CONFIG, "``", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "IDENT + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_IDENT, "[0] empty quoted IDENT");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 2,
+         "[0] just the two backticks");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* Unterminated quoted identifier reuses string recovery. */
+  ASSERT(run_lex_with(&QUOTED_IDENT_CONFIG, "`a b", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "INVALID + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_INVALID, "[0] INVALID");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 4,
+         "[0] spans the unterminated identifier");
+  ASSERT(diags.count == 1, "one diag");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 /* ── String interpolation tests ─────────────────────────────────────── */
 
 static int test_template_bare_and_braced_interpolation(void) {
@@ -1391,6 +1848,377 @@ static int test_template_unbalanced_interpolation(void) {
   return 0;
 }
 
+static int test_template_lone_dollar_literal(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Dual-form rules (`$` / NULL close): a marker followed by neither
+   * `{` nor an ident start is literal text (Kotlin semantics). */
+  ASSERT(run_lex_with(&TEMPLATE_CONFIG, "\"price: $\"", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "STRING + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] one plain STRING");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 10,
+         "[0] trailing $ stays inside the literal");
+  ASSERT(diags.count == 0, "lone $ before the close quote is not an error");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex_with(&TEMPLATE_CONFIG, "\"$ x\"", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 2, "STRING + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] one plain STRING");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 5,
+         "[0] $ before whitespace stays inside the literal");
+  ASSERT(diags.count == 0, "lone $ mid-string is not an error");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* `$` before an ident start still interpolates. */
+  ASSERT(run_lex_with(&TEMPLATE_CONFIG, "\"$x\"", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 4, "STRING IDENT STRING EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] head fragment");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 1,
+         "[0] just the open quote");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT, "[1] interpolated x");
+  ASSERT(tokens.items[1].span.start == 2 && tokens.items[1].span.len == 1,
+         "[1] spans x without the $");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_STRING, "[2] tail fragment");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_template_explicit_close_always_enters(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Explicit-close rules keep the always-enter behavior: whitespace
+   * right after `\(` still opens the (empty) expression. */
+  ASSERT(run_lex_with(&SWIFT_TEMPLATE_CONFIG, "\"\\( )\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 3, "STRING STRING EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] head fragment");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 1,
+         "[0] open quote before the marker");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_STRING, "[1] tail fragment");
+  ASSERT(tokens.items[1].span.start == 5 && tokens.items[1].span.len == 1,
+         "[1] close quote after the interpolation");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_EOF, "[2] EOF");
+  ASSERT(diags.count == 0, "empty explicit-close interpolation is fine");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex_with(&SWIFT_TEMPLATE_CONFIG, "\"a \\(1)b\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 4, "STRING INT STRING EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] head fragment");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 3,
+         "[0] spans quote + text before the marker");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_INT, "[1] interpolated 1");
+  ASSERT(tokens.items[1].span.start == 5 && tokens.items[1].span.len == 1,
+         "[1] expression token at its byte offset");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_STRING, "[2] tail fragment");
+  ASSERT(tokens.items[2].span.start == 7 && tokens.items[2].span.len == 2,
+         "[2] text after ) through close quote");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+/* ── Interpolation marker-token tests ───────────────────────────────── */
+
+static int test_template_marker_tokens(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Bare `$x`: fragments retag to fragment_kind with v = head(1)/tail(3)
+   * and the `$ident` entry is ONE token including the `$`. No open
+   * marker for the bare form. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"a $x b\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 4, "FRAGMENT BARE_IDENT FRAGMENT EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT, "[0] head fragment kind");
+  ASSERT(tokens.items[0].v == 1, "[0] v = 1 (head)");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 3,
+         "[0] spans quote through text before $x");
+  ASSERT(tokens.items[1].kind == MARK_BARE_IDENT, "[1] bare-ident kind");
+  ASSERT(tokens.items[1].v == 0, "[1] v = 0");
+  ASSERT(tokens.items[1].span.start == 3 && tokens.items[1].span.len == 2,
+         "[1] spans $x including the $");
+  ASSERT(tokens.items[2].kind == MARK_FRAGMENT, "[2] tail fragment kind");
+  ASSERT(tokens.items[2].v == 3, "[2] v = 3 (tail)");
+  ASSERT(tokens.items[2].span.start == 5 && tokens.items[2].span.len == 3,
+         "[2] spans text after x through close quote");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_EOF, "[3] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* No interpolation → ONE normal STRING with v = 0, even though
+   * fragment_kind is configured. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"plain\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 2, "STRING + EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] plain STRING kind");
+  ASSERT(tokens.items[0].v == 0, "[0] v = 0");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 7,
+         "[0] whole literal");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_template_marker_interior_fragment(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* A fragment BETWEEN two interpolations is interior: v = 2, not another
+   * head. Regression: a survived mutant once tagged every pre-interp
+   * fragment v = 1, which only multi-interpolation literals can catch. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"a $x m $y b\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 6, "FRAG BARE FRAG BARE FRAG EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT && tokens.items[0].v == 1,
+         "[0] head fragment v = 1");
+  ASSERT(tokens.items[1].kind == MARK_BARE_IDENT, "[1] $x");
+  ASSERT(tokens.items[2].kind == MARK_FRAGMENT, "[2] interior fragment kind");
+  ASSERT(tokens.items[2].v == 2, "[2] v = 2 (interior, NOT head)");
+  ASSERT(tokens.items[2].span.start == 5 && tokens.items[2].span.len == 3,
+         "[2] spans ` m ` between the interpolations");
+  ASSERT(tokens.items[3].kind == MARK_BARE_IDENT, "[3] $y");
+  ASSERT(tokens.items[4].kind == MARK_FRAGMENT && tokens.items[4].v == 3,
+         "[4] tail fragment v = 3");
+  ASSERT(tokens.items[5].kind == KAVAK_TOK_EOF, "[5] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* Same for the braced form: `-` between `${a}` and `${b}` is interior. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"${a}-${b}\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 10, "FRAG OPEN a CLOSE FRAG OPEN b CLOSE FRAG EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT && tokens.items[0].v == 1,
+         "[0] head is just the open quote, v = 1");
+  ASSERT(tokens.items[4].kind == MARK_FRAGMENT, "[4] interior fragment kind");
+  ASSERT(tokens.items[4].v == 2, "[4] v = 2 (interior)");
+  ASSERT(tokens.items[4].span.start == 5 && tokens.items[4].span.len == 1,
+         "[4] spans the `-`");
+  ASSERT(tokens.items[8].kind == MARK_FRAGMENT && tokens.items[8].v == 3,
+         "[8] tail fragment v = 3");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_template_marker_braced_and_adjacent(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* `${...}`: OPEN marker over `${`, CLOSE marker over `}`, expression
+   * tokens unchanged in between. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"pre ${1 + 2} post\"",
+                      &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 8, "FRAG OPEN INT OP INT CLOSE FRAG EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT && tokens.items[0].v == 1,
+         "[0] head fragment");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 5,
+         "[0] spans \"pre ");
+  ASSERT(tokens.items[1].kind == MARK_INTERP_OPEN, "[1] open marker");
+  ASSERT(tokens.items[1].v == 0, "[1] marker v = 0");
+  ASSERT(tokens.items[1].span.start == 5 && tokens.items[1].span.len == 2,
+         "[1] spans exactly ${");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_INT, "[2] INT 1");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_OP && tokens.items[3].v == OP_PLUS,
+         "[3] + inside the hole");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_INT, "[4] INT 2");
+  ASSERT(tokens.items[5].kind == MARK_INTERP_CLOSE, "[5] close marker");
+  ASSERT(tokens.items[5].v == 0, "[5] marker v = 0");
+  ASSERT(tokens.items[5].span.start == 12 && tokens.items[5].span.len == 1,
+         "[5] spans exactly }");
+  ASSERT(tokens.items[6].kind == MARK_FRAGMENT && tokens.items[6].v == 3,
+         "[6] tail fragment");
+  ASSERT(tokens.items[6].span.start == 13 && tokens.items[6].span.len == 6,
+         "[6] spans  post\"");
+  ASSERT(tokens.items[7].kind == KAVAK_TOK_EOF, "[7] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* Adjacent interpolations: no empty interior fragment between them,
+   * but head and tail always exist (open/close delimiters). */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"$a$b\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 5, "FRAG BARE BARE FRAG EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT && tokens.items[0].v == 1,
+         "[0] head fragment");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 1,
+         "[0] just the open quote");
+  ASSERT(tokens.items[1].kind == MARK_BARE_IDENT, "[1] $a entry");
+  ASSERT(tokens.items[1].span.start == 1 && tokens.items[1].span.len == 2,
+         "[1] spans $a");
+  ASSERT(tokens.items[2].kind == MARK_BARE_IDENT, "[2] $b entry, no fragment between");
+  ASSERT(tokens.items[2].span.start == 3 && tokens.items[2].span.len == 2,
+         "[2] spans $b");
+  ASSERT(tokens.items[3].kind == MARK_FRAGMENT && tokens.items[3].v == 3,
+         "[3] tail fragment");
+  ASSERT(tokens.items[3].span.start == 5 && tokens.items[3].span.len == 1,
+         "[3] just the close quote");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_EOF, "[4] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_template_marker_nested(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* Nested template inside `${...}`: inner fragments carry their own
+   * head/tail v-tags, so the parser can rebuild nesting from kinds. */
+  ASSERT(run_lex_with(&MARKER_TEMPLATE_CONFIG, "\"x${\"in $y\"}z\"",
+                      &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 8, "FRAG OPEN FRAG BARE FRAG CLOSE FRAG EOF");
+  ASSERT(tokens.items[0].kind == MARK_FRAGMENT && tokens.items[0].v == 1,
+         "[0] outer head");
+  ASSERT(tokens.items[0].span.start == 0 && tokens.items[0].span.len == 2,
+         "[0] spans \"x");
+  ASSERT(tokens.items[1].kind == MARK_INTERP_OPEN, "[1] outer ${ marker");
+  ASSERT(tokens.items[1].span.start == 2 && tokens.items[1].span.len == 2,
+         "[1] spans ${");
+  ASSERT(tokens.items[2].kind == MARK_FRAGMENT && tokens.items[2].v == 1,
+         "[2] inner head");
+  ASSERT(tokens.items[2].span.start == 4 && tokens.items[2].span.len == 4,
+         "[2] spans \"in ");
+  ASSERT(tokens.items[3].kind == MARK_BARE_IDENT, "[3] inner $y entry");
+  ASSERT(tokens.items[3].span.start == 8 && tokens.items[3].span.len == 2,
+         "[3] spans $y");
+  ASSERT(tokens.items[4].kind == MARK_FRAGMENT && tokens.items[4].v == 3,
+         "[4] inner tail");
+  ASSERT(tokens.items[4].span.start == 10 && tokens.items[4].span.len == 1,
+         "[4] just the inner close quote");
+  ASSERT(tokens.items[5].kind == MARK_INTERP_CLOSE, "[5] outer } marker");
+  ASSERT(tokens.items[5].span.start == 11 && tokens.items[5].span.len == 1,
+         "[5] spans }");
+  ASSERT(tokens.items[6].kind == MARK_FRAGMENT && tokens.items[6].v == 3,
+         "[6] outer tail");
+  ASSERT(tokens.items[6].span.start == 12 && tokens.items[6].span.len == 2,
+         "[6] spans z\"");
+  ASSERT(tokens.items[7].kind == KAVAK_TOK_EOF, "[7] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+/* ── emit_newlines tests ────────────────────────────────────────────── */
+
+static int test_emit_newlines_every_line(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* One NEWLINE per physical newline, blank lines included, nothing
+   * extra at EOF. */
+  ASSERT(run_lex_with(&EMIT_NEWLINES_CONFIG, "a\nb\n\nc", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 7, "IDENT NL IDENT NL NL IDENT EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_IDENT, "[0] a");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_NEWLINE, "[1] NEWLINE after a");
+  ASSERT(tokens.items[1].span.start == 1 && tokens.items[1].span.len == 1,
+         "[1] spans the newline byte");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_IDENT, "[2] b");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_NEWLINE, "[3] NEWLINE after b");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_NEWLINE, "[4] NEWLINE for the blank line");
+  ASSERT(tokens.items[4].span.start == 4 && tokens.items[4].span.len == 1,
+         "[4] blank line newline byte");
+  ASSERT(tokens.items[5].kind == KAVAK_TOK_IDENT, "[5] c");
+  ASSERT(tokens.items[6].kind == KAVAK_TOK_EOF, "[6] EOF, no virtual NEWLINE");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* A trailing newline emits its NEWLINE; EOF adds nothing on top. */
+  ASSERT(run_lex_with(&EMIT_NEWLINES_CONFIG, "a\n", &tokens, &diags) == 0, "rc 0");
+  ASSERT(tokens.count == 3, "IDENT NEWLINE EOF");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_NEWLINE, "[1] trailing NEWLINE");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_EOF, "[2] EOF right after");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
+static int test_emit_newlines_interpolation_and_comments(void) {
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  /* A newline inside a `${...}` hole still emits its NEWLINE token. */
+  ASSERT(run_lex_with(&EMIT_NEWLINES_CONFIG, "\"x${a\n+b}y\"", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 7, "STRING IDENT NEWLINE OP IDENT STRING EOF");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_STRING, "[0] head fragment");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_IDENT, "[1] a");
+  ASSERT(tokens.items[2].kind == KAVAK_TOK_NEWLINE, "[2] NEWLINE inside the hole");
+  ASSERT(tokens.items[2].span.start == 5 && tokens.items[2].span.len == 1,
+         "[2] spans the newline byte");
+  ASSERT(tokens.items[3].kind == KAVAK_TOK_OP && tokens.items[3].v == OP_PLUS,
+         "[3] + after the newline");
+  ASSERT(tokens.items[4].kind == KAVAK_TOK_IDENT, "[4] b");
+  ASSERT(tokens.items[5].kind == KAVAK_TOK_STRING, "[5] tail fragment");
+  ASSERT(tokens.items[6].kind == KAVAK_TOK_EOF, "[6] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  kavak_token_vec_init(&tokens);
+  kavak_diag_vec_init(&diags);
+
+  /* Newlines swallowed by a block comment never emit. */
+  ASSERT(run_lex_with(&EMIT_NEWLINES_CONFIG, "/* a\nb */x", &tokens, &diags) == 0,
+         "rc 0");
+  ASSERT(tokens.count == 2, "IDENT + EOF, no NEWLINE from the comment");
+  ASSERT(tokens.items[0].kind == KAVAK_TOK_IDENT, "[0] IDENT x");
+  ASSERT(tokens.items[0].span.start == 9 && tokens.items[0].span.len == 1,
+         "[0] x right after the comment");
+  ASSERT(tokens.items[1].kind == KAVAK_TOK_EOF, "[1] EOF");
+  ASSERT(diags.count == 0, "no diags");
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 /* ── Auto-semicolon tests ───────────────────────────────────────────── */
 
 static int test_auto_semicolon_newline_and_eof(void) {
@@ -1472,6 +2300,7 @@ int main(void) {
   fails += test_null_diags_no_crash();
   fails += test_identifier_basic();
   fails += test_keyword_match();
+  fails += test_soft_keyword();
   fails += test_keyword_prefix();
   fails += test_custom_ident_start();
   fails += test_unicode_ident_hooks();
@@ -1487,6 +2316,7 @@ int main(void) {
   fails += test_block_comment_nested();
   fails += test_doc_comment_kept();
   fails += test_doc_comment_skipped();
+  fails += test_keep_comments();
   fails += test_operator_single();
   fails += test_operator_longest_eq();
   fails += test_operator_longest_three();
@@ -1501,8 +2331,13 @@ int main(void) {
   fails += test_number_float_and_exponent();
   fails += test_number_malformed_resync();
   fails += test_number_invalid_prefixed_literal();
+  fails += test_number_strict_invalid_digits();
+  fails += test_hex_escape_helper();
   fails += test_number_suffixes();
+  fails += test_number_suffix_boundary();
   fails += test_number_suffix_longest_unsorted();
+  fails += test_number_leading_dot();
+  fails += test_number_underscore_runs();
   fails += test_string_basic_escape();
   fails += test_string_single_quote_char();
   fails += test_string_triple_longest_open();
@@ -1511,14 +2346,23 @@ int main(void) {
   fails += test_string_invalid_utf8_escape_skips_sequence();
   fails += test_string_unterminated_eof();
   fails += test_string_unterminated_newline_recovers();
+  fails += test_string_quoted_identifier();
   fails += test_template_bare_and_braced_interpolation();
   fails += test_template_balances_inner_braces();
   fails += test_template_unbalanced_interpolation();
+  fails += test_template_lone_dollar_literal();
+  fails += test_template_explicit_close_always_enters();
+  fails += test_template_marker_tokens();
+  fails += test_template_marker_interior_fragment();
+  fails += test_template_marker_braced_and_adjacent();
+  fails += test_template_marker_nested();
+  fails += test_emit_newlines_every_line();
+  fails += test_emit_newlines_interpolation_and_comments();
   fails += test_auto_semicolon_newline_and_eof();
   fails += test_tinylang_smoke();
 
   if (fails == 0) {
-    printf("  ✓ test_lexer: 52/52 passed\n");
+    printf("  ✓ test_lexer: 68/68 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_lexer: %d failure(s)\n", fails);

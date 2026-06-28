@@ -8,12 +8,12 @@
  */
 
 #include "kavak.h"
+#include "kavak_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 const char *kavak_version(void) { return KAVAK_VERSION_STRING; }
-void kavak_utf8_init(void);
 
 /* Session is opaque in kavak.h; the internal struct carries the
  * descriptor pointer and per-session type arena through the analysis
@@ -92,6 +92,10 @@ void kavak_session_free(KavakSession *session) {
 
 KavakTypeArena *kavak_session_type_arena(KavakSession *session) {
   return session ? &session->type_arena : NULL;
+}
+
+int kavak_session_reset_types(KavakSession *session) {
+  return session ? kavak_type_arena_reset(&session->type_arena) : -1;
 }
 
 const KavakLanguage *kavak_session_language(const KavakSession *session) {
@@ -176,9 +180,12 @@ void kavak_result_free(KavakResult *r) {
 }
 
 const KavakASTNode *kavak_root        (const KavakResult *r) { return r ? r->root : NULL; }
-const KavakSource  *kavak_source      (const KavakResult *r) { return r ? &r->source : NULL; }
+const KavakSource  *kavak_result_source(const KavakResult *r) { return r ? &r->source : NULL; }
 const KavakToken   *kavak_tokens      (const KavakResult *r) { return r ? r->tokens.items : NULL; }
 size_t              kavak_token_count (const KavakResult *r) { return r ? r->tokens.count : 0; }
+const KavakLanguage *kavak_result_language(const KavakResult *r) {
+  return r && r->session ? r->session->lang : NULL;
+}
 
 uint32_t kavak_error_count(const KavakResult *r) {
   return r ? kavak_diag_error_count(&r->diags) : 0;
@@ -214,4 +221,24 @@ uint32_t kavak_error_col(const KavakResult *r, const uint32_t i) {
   uint32_t col = 0;
   kavak_source_pos(&r->source, diag->span.start, NULL, &col);
   return col;
+}
+
+int kavak_error_at(const KavakResult *r, const uint32_t i,
+                   const char **out_message, uint32_t *out_line,
+                   uint32_t *out_col) {
+  const KavakDiag *diag = nth_error(r, i);
+  if (!diag) {
+    if (out_message) *out_message = "";
+    if (out_line) *out_line = 0;
+    if (out_col) *out_col = 0;
+    return 0;
+  }
+  if (out_message) *out_message = diag->message ? diag->message : "";
+  if (out_line || out_col) {
+    uint32_t line = 0, col = 0;
+    kavak_source_pos(&r->source, diag->span.start, &line, &col);
+    if (out_line) *out_line = line;
+    if (out_col) *out_col = col;
+  }
+  return 1;
 }

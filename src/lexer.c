@@ -38,6 +38,11 @@ static int lexer_config_valid(const KavakLexerConfig *config) {
     if (!text || text[0] == '\0') return 0;
   }
 
+  /* Soft keywords reference keyword ids and are dereferenced during identifier
+   * retagging; a non-zero count with a NULL table is a NULL-deref waiting to
+   * happen. */
+  if (config->soft_keyword_count != 0 && !config->soft_keywords) return 0;
+
   if (config->operator_count != 0 && !config->operators) return 0;
   for (uint32_t i = 0; i < config->operator_count; ++i) {
     const char *text = config->operators[i].text;
@@ -51,8 +56,8 @@ static int lexer_config_valid(const KavakLexerConfig *config) {
     if (!rule->close || rule->close[0] == '\0') return 0;
   }
 
-  if (config->string_rule_count != 0 && !config->strings) return 0;
-  for (uint32_t i = 0; i < config->string_rule_count; ++i) {
+  if (config->string_count != 0 && !config->strings) return 0;
+  for (uint32_t i = 0; i < config->string_count; ++i) {
     const KavakStringRule *rule = &config->strings[i];
     if (!rule->open || rule->open[0] == '\0') return 0;
     if (!rule->close || rule->close[0] == '\0') return 0;
@@ -194,6 +199,51 @@ static int ascii_digit_value(const unsigned char c) {
   return -1;
 }
 
+static int is_unicode_scalar(const uint32_t cp) {
+  return cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu);
+}
+
+size_t kavak_scan_hex_escape(const char *s, const char *end, const char form,
+                             uint32_t *out_cp) {
+  if (!s || !end || s >= end) return 0;
+
+  uint32_t fixed;
+  switch (form) {
+    case 'x': fixed = 2; break;
+    case 'u': fixed = 4; break;  /* fixed \uHHHH, or braced \u{H+} below */
+    case 'U': fixed = 8; break;
+    default: return 0;
+  }
+
+  /* Braced \u{H+}: 1..6 hex digits, any Unicode scalar value. */
+  if (form == 'u' && *s == '{') {
+    const char *p = s + 1;
+    uint32_t cp = 0, digits = 0;
+    for (; p < end && *p != '}'; ++p) {
+      const int d = ascii_digit_value((unsigned char)*p);
+      if (d < 0 || digits == 6u) return 0;
+      cp = (cp << 4) | (uint32_t)d;
+      ++digits;
+    }
+    if (digits == 0 || p >= end || *p != '}' || !is_unicode_scalar(cp)) return 0;
+    if (out_cp) *out_cp = cp;
+    return (size_t)(p - s) + 1u;  /* through the closing brace */
+  }
+
+  /* Fixed-width form: exactly `fixed` hex digits. */
+  if ((size_t)(end - s) < (size_t)fixed) return 0;
+  uint32_t cp = 0;
+  for (uint32_t i = 0; i < fixed; ++i) {
+    const int d = ascii_digit_value((unsigned char)s[i]);
+    if (d < 0) return 0;
+    cp = (cp << 4) | (uint32_t)d;
+  }
+  /* \u / \U must denote a Unicode scalar; \x is a raw byte 0x00..0xFF. */
+  if (form != 'x' && !is_unicode_scalar(cp)) return 0;
+  if (out_cp) *out_cp = cp;
+  return fixed;
+}
+
 static int is_digit_for_base(const unsigned char c, const uint32_t base) {
   const int value = ascii_digit_value(c);
   return value >= 0 && (uint32_t)value < base;
@@ -278,8 +328,14 @@ static ScanResult try_scan_identifier(Lexer *lex) {
     const size_t kwlen = strlen(kw);
     if (kwlen == span.len &&
         memcmp(lex->source->bytes + span.start, kw, kwlen) == 0) {
-      return emit_token(lex, KAVAK_TOK_KEYWORD, span, cfg->keywords[i].id) == 0
-                 ? SCAN_MATCHED : SCAN_OOM;
+      /* Soft (contextual) keywords stay IDENT tokens so they remain usable as
+       * names; the keyword id rides along in v for context-sensitive parsing. */
+      const uint32_t id = cfg->keywords[i].id;
+      uint32_t kind = KAVAK_TOK_KEYWORD;
+      for (uint32_t j = 0; j < cfg->soft_keyword_count; ++j) {
+        if (cfg->soft_keywords[j] == id) { kind = KAVAK_TOK_IDENT; break; }
+      }
+      return emit_token(lex, kind, span, id) == 0 ? SCAN_MATCHED : SCAN_OOM;
     }
   }
   return emit_token(lex, KAVAK_TOK_IDENT, span, 0) == 0 ? SCAN_MATCHED
@@ -298,10 +354,18 @@ static uint32_t scan_digits(Lexer *lex, const uint32_t base,
       if (digit_count != UINT32_MAX) digit_count++;
       continue;
     }
-    if (c == '_' && (flags & KAVAK_NUM_UNDERSCORES) && digit_count > 0 &&
-        byte_at_is_digit_for_base(lex, lex->pos + 1, base)) {
-      lex->pos += 2;
-      if (digit_count != UINT32_MAX) digit_count++;
+    /* Underscore separators run between digits, Java/Kotlin style: a
+     * whole `_` run is consumed when a digit of the base follows it
+     * (`1__2` is one literal); otherwise the number stops before the
+     * run (`1_` is INT `1` then IDENT `_`). */
+    if (c == '_' && (flags & KAVAK_NUM_UNDERSCORES) && digit_count > 0) {
+      uint32_t run_end = lex->pos;
+      while (run_end < (uint32_t)lex->source->len &&
+             lex->source->bytes[run_end] == '_') {
+        run_end++;
+      }
+      if (!byte_at_is_digit_for_base(lex, run_end, base)) break;
+      lex->pos = run_end;
       continue;
     }
     break;
@@ -336,12 +400,44 @@ static void consume_number_suffix(Lexer *lex) {
       best_len = len;
     }
   }
-  if (best) lex->pos += (uint32_t)best_len;
+  if (!best) return;
+
+  /* Optional strictness: reject a suffix that runs straight into more
+   * identifier characters, so "123usize" (suffix "u") is not split into
+   * 123u + size but kept as 123 + the identifier "usize". */
+  if (numbers->flags & KAVAK_NUM_SUFFIX_REQUIRES_BOUNDARY) {
+    const size_t after = (size_t)lex->pos + best_len;
+    uint32_t cp = 0;
+    const int n = kavak_utf8_decode(lex->source->bytes + after,
+                                    lex->source->bytes + lex->source->len, &cp);
+    if (n != 0 && is_ident_cont_cfg(lex, cp)) return;  /* boundary violated */
+  }
+
+  lex->pos += (uint32_t)best_len;
 }
 
 static ScanResult emit_number(Lexer *lex, const uint32_t start,
                               const uint32_t kind) {
   consume_number_suffix(lex);
+
+  /* Strict mode: a literal that runs straight into identifier characters
+   * (e.g. `0x1g`, `12abc`) is one malformed token, not a number plus an
+   * identifier. Any valid suffix was already consumed above, so `123u` is
+   * unaffected. Pull the trailing run in so the diagnostic spans the whole
+   * bad token. */
+  if (lex->config->numbers.flags & KAVAK_NUM_STRICT_INVALID_DIGITS) {
+    uint32_t cp = 0;
+    int n = peek_cp(lex, &cp);
+    if (n != 0 && is_ident_cont_cfg(lex, cp)) {
+      do {
+        lex->pos += (uint32_t)n;
+        n = peek_cp(lex, &cp);
+      } while (n != 0 && is_ident_cont_cfg(lex, cp));
+      return emit_invalid(lex, start, "malformed number literal") == 0
+               ? SCAN_MATCHED : SCAN_OOM;
+    }
+  }
+
   return emit_token(lex, kind, kavak_span_from_to(start, lex->pos), 0) == 0
            ? SCAN_MATCHED : SCAN_OOM;
 }
@@ -352,13 +448,23 @@ static ScanResult emit_number(Lexer *lex, const uint32_t start,
  * literal. Floats/exponents are decimal-only; languages that need
  * `p`-style hex floats provide a descriptor-owned numeric scanner. */
 static ScanResult try_scan_number(Lexer *lex) {
-  if (!byte_at_is_digit_for_base(lex, lex->pos, 10)) return SCAN_NO_MATCH;
-
   const KavakNumberStyle *numbers = &lex->config->numbers;
   const uint32_t flags = numbers->flags;
   const uint32_t start = lex->pos;
 
-  if (peek(lex) == '0' && lex->pos + 1 < (uint32_t)lex->source->len) {
+  /* Leading-dot floats (`.5`) are opt-in and need a digit right after
+   * the dot, so `1..2` and `.x` are untouched — the number scanner runs
+   * before the operator/punct scanner, so `.5` wins over punct `.`. */
+  const int leading_dot =
+      (flags & KAVAK_NUM_LEADING_DOT) && (flags & KAVAK_NUM_FLOAT) &&
+      peek(lex) == '.' && byte_at_is_digit_for_base(lex, lex->pos + 1, 10);
+
+  if (!leading_dot && !byte_at_is_digit_for_base(lex, lex->pos, 10)) {
+    return SCAN_NO_MATCH;
+  }
+
+  if (!leading_dot &&
+      peek(lex) == '0' && lex->pos + 1 < (uint32_t)lex->source->len) {
     const unsigned char marker = (unsigned char)lex->source->bytes[lex->pos + 1];
     uint32_t base = 0;
     if ((marker == 'x' || marker == 'X') && (flags & KAVAK_NUM_BASE_HEX)) base = 16;
@@ -375,14 +481,20 @@ static ScanResult try_scan_number(Lexer *lex) {
     }
   }
 
-  (void)scan_digits(lex, 10, flags);
-
   uint32_t kind = KAVAK_TOK_INT;
-  if ((flags & KAVAK_NUM_FLOAT) && peek(lex) == '.' &&
-      byte_at_is_digit_for_base(lex, lex->pos + 1, 10)) {
+  if (leading_dot) {
+    /* One fraction per literal: `.5.6` lexes as FLOAT `.5`, FLOAT `.6`. */
     kind = KAVAK_TOK_FLOAT;
     lex->pos++;
     (void)scan_digits(lex, 10, flags);
+  } else {
+    (void)scan_digits(lex, 10, flags);
+    if ((flags & KAVAK_NUM_FLOAT) && peek(lex) == '.' &&
+        byte_at_is_digit_for_base(lex, lex->pos + 1, 10)) {
+      kind = KAVAK_TOK_FLOAT;
+      lex->pos++;
+      (void)scan_digits(lex, 10, flags);
+    }
   }
 
   if ((flags & KAVAK_NUM_EXPONENT) && exponent_starts_here(lex)) {
@@ -403,7 +515,7 @@ static const KavakStringRule *match_longest_string_rule(const Lexer *lex,
   if (!cfg->strings) return NULL;
   const KavakStringRule  *best = NULL;
   size_t                  best_len = 0;
-  for (uint32_t i = 0; i < cfg->string_rule_count; ++i) {
+  for (uint32_t i = 0; i < cfg->string_count; ++i) {
     const char *open = cfg->strings[i].open;
     if (!open || open[0] == '\0' || !cfg->strings[i].close) continue;
     const size_t len = strlen(open);
@@ -428,13 +540,35 @@ static int string_rule_allows_newline(const KavakStringRule *rule) {
   return (rule->flags & (KAVAK_STR_FLAG_TRIPLE | KAVAK_STR_FLAG_MULTILINE)) != 0;
 }
 
-/* A single-quote rule emits CHAR. The token remains span-only; validating
- * "exactly one decoded scalar" belongs to the language layer that re-decodes
- * the span. */
 static int string_rule_emits_char(const KavakStringRule *rule) {
+  if (rule->flags & KAVAK_STR_FLAG_CHAR) return 1;
   return strcmp(rule->open, "'") == 0 && strcmp(rule->close, "'") == 0 &&
          (rule->flags & (KAVAK_STR_FLAG_TRIPLE | KAVAK_STR_FLAG_MULTILINE |
                          KAVAK_STR_FLAG_TEMPLATE)) == 0;
+}
+
+/* Token kind at the close delimiter. IDENT (quoted identifiers) is
+ * checked first so an IDENT-flagged `'…'` rule never falls into the
+ * CHAR heuristic. */
+static uint32_t string_rule_close_kind(const KavakStringRule *rule) {
+  if (rule->flags & KAVAK_STR_FLAG_IDENT) return KAVAK_TOK_IDENT;
+  return string_rule_emits_char(rule) ? KAVAK_TOK_CHAR : KAVAK_TOK_STRING;
+}
+
+/* For the `$`/NULL dual form a marker followed by neither `{` nor an
+ * identifier start is literal text (Kotlin's lone-`$` rule), so the
+ * fragment keeps going instead of erroring. Rules with an explicit
+ * interp_close always enter the interpolation. */
+static int interp_marker_starts_interpolation(const Lexer *lex,
+                                              const KavakStringRule *rule) {
+  if (rule->interp_close) return 1;
+  const uint32_t after = lex->pos + (uint32_t)strlen(rule->interp_open);
+  if (after >= (uint32_t)lex->source->len) return 0;
+  if (lex->source->bytes[after] == '{') return 1;
+  uint32_t cp;
+  const int n = kavak_utf8_decode(lex->source->bytes + after,
+                                  lex->source->bytes + lex->source->len, &cp);
+  return n != 0 && is_ident_start_cfg(lex, cp);
 }
 
 static const char *paired_open_for_close(const char *close) {
@@ -453,8 +587,32 @@ static int emit_interpolation_invalid(Lexer *lex, const uint32_t start,
   return emit_invalid(lex, start, message);
 }
 
+/* Whitespace inside `${...}` swallows newlines — no layout or auto-semi
+ * events fire in interpolation — but emit_newlines still wants the
+ * physical NEWLINE tokens. Returns 0, or -1 on token-push OOM. */
+static int skip_interpolation_whitespace(Lexer *lex) {
+  if (!lex->config->emit_newlines) {
+    skip_whitespace(lex);
+    return 0;
+  }
+  while (!at_eof(lex)) {
+    const uint32_t n = newline_len_at(lex, lex->pos);
+    if (n != 0) {
+      if (emit_token(lex, KAVAK_TOK_NEWLINE, kavak_span_make(lex->pos, n), 0) != 0) {
+        return -1;
+      }
+      lex->pos += n;
+      continue;
+    }
+    if (!is_inline_ws(peek(lex))) break;
+    lex->pos++;
+  }
+  return 0;
+}
+
 static int scan_interpolation_expression(Lexer *lex, const uint32_t interp_start,
-                                         const char *close) {
+                                         const char *close,
+                                         const uint32_t close_kind) {
   if (lex->interp_depth >= KAVAK_MAX_INTERP_DEPTH) {
     return emit_interpolation_invalid(lex, interp_start,
                                       "string interpolation nesting too deep") == 0 ? 0 : -1;
@@ -466,15 +624,24 @@ static int scan_interpolation_expression(Lexer *lex, const uint32_t interp_start
   uint32_t pair_depth = 0;
 
   for (;;) {
-    skip_whitespace(lex);
+    if (skip_interpolation_whitespace(lex) != 0) {
+      lex->interp_depth--;
+      return -1;
+    }
     if (at_eof(lex)) {
       lex->interp_depth--;
       return emit_invalid(lex, interp_start, "unterminated string interpolation") == 0 ? 0 : -1;
     }
 
     if (pair_depth == 0 && close_len > 0 && match_lit(lex, close)) {
+      const uint32_t close_start = lex->pos;
       lex->pos += (uint32_t)close_len;
       lex->interp_depth--;
+      if (close_kind != 0 &&
+          emit_token(lex, close_kind,
+                     kavak_span_from_to(close_start, lex->pos), 0) != 0) {
+        return -1;
+      }
       return 1;
     }
 
@@ -503,12 +670,35 @@ static int scan_interpolation_expression(Lexer *lex, const uint32_t interp_start
   }
 }
 
-static int scan_bare_interpolation_identifier(Lexer *lex, const uint32_t interp_start) {
+static int scan_bare_interpolation_identifier(Lexer *lex,
+                                              const KavakStringRule *rule,
+                                              const uint32_t interp_start) {
   const ScanResult r = try_scan_identifier(lex);
   if (r == SCAN_OOM) return -1;
-  if (r == SCAN_MATCHED) return 1;
+  if (r == SCAN_MATCHED) {
+    if (rule->bare_ident_kind != 0) {
+      /* Patch the just-pushed ident in place: one token spanning the
+       * whole `$ident` entry. Unconditional, so a KEYWORD retag is
+       * overridden too — `$it`-style names stay simple entries. */
+      KavakToken *token = &lex->tokens->items[lex->tokens->count - 1];
+      token->kind = rule->bare_ident_kind;
+      token->span = kavak_span_from_to(interp_start, lex->pos);
+      token->v    = 0;
+    }
+    return 1;
+  }
   return emit_interpolation_invalid(lex, interp_start,
                                     "expected identifier after interpolation marker") == 0 ? 0 : -1;
+}
+
+/* Marker token over the consumed interpolation opener, emitted eagerly
+ * before the body so markers stay stream-ordered. Returns 0 / -1 on
+ * token-push OOM. */
+static int emit_interp_open_marker(Lexer *lex, const KavakStringRule *rule,
+                                   const uint32_t interp_start) {
+  if (rule->interp_open_kind == 0) return 0;
+  return emit_token(lex, rule->interp_open_kind,
+                    kavak_span_from_to(interp_start, lex->pos), 0);
 }
 
 static int scan_string_interpolation(Lexer *lex, const KavakStringRule *rule,
@@ -517,7 +707,9 @@ static int scan_string_interpolation(Lexer *lex, const KavakStringRule *rule,
   lex->pos += (uint32_t)open_len;
 
   if (rule->interp_close) {
-    return scan_interpolation_expression(lex, interp_start, rule->interp_close);
+    if (emit_interp_open_marker(lex, rule, interp_start) != 0) return -1;
+    return scan_interpolation_expression(lex, interp_start, rule->interp_close,
+                                         rule->interp_close_kind);
   }
 
   /* `$` with NULL close covers both bare identifiers and `${...}`
@@ -525,10 +717,13 @@ static int scan_string_interpolation(Lexer *lex, const KavakStringRule *rule,
    * opening marker decides which form this occurrence uses. */
   if (open_len == 1 && rule->interp_open[0] == '$' && match_lit(lex, "{")) {
     lex->pos++;
-    return scan_interpolation_expression(lex, interp_start, "}");
+    if (emit_interp_open_marker(lex, rule, interp_start) != 0) return -1;
+    return scan_interpolation_expression(lex, interp_start, "}",
+                                         rule->interp_close_kind);
   }
 
-  return scan_bare_interpolation_identifier(lex, interp_start);
+  /* The bare `$ident` form has no opener beyond the `$` — no marker. */
+  return scan_bare_interpolation_identifier(lex, rule, interp_start);
 }
 
 static ScanResult try_scan_string(Lexer *lex) {
@@ -543,6 +738,7 @@ static ScanResult try_scan_string(Lexer *lex) {
   const int is_template = (rule->flags & KAVAK_STR_FLAG_TEMPLATE) != 0 &&
                           rule->interp_open && rule->interp_open[0] != '\0';
   uint32_t fragment_start = start;
+  int had_interp = 0;            /* literal contains >=1 interpolation */
   lex->pos += (uint32_t)open_len;
 
   for (;;) {
@@ -559,17 +755,30 @@ static ScanResult try_scan_string(Lexer *lex) {
 
     if (close_len > 0 && match_lit(lex, rule->close)) {
       lex->pos += (uint32_t)close_len;
-      const uint32_t kind = string_rule_emits_char(rule) ? KAVAK_TOK_CHAR
-                                                         : KAVAK_TOK_STRING;
-      return emit_token(lex, kind, kavak_span_from_to(fragment_start, lex->pos), 0) == 0
+      /* fragment_kind retags every fragment of an interpolated literal;
+       * a literal with no interpolation stays one normal token (v=0). */
+      const int tagged = had_interp && rule->fragment_kind != 0;
+      const uint32_t kind = tagged ? rule->fragment_kind
+                                   : string_rule_close_kind(rule);
+      const uint32_t v = tagged ? 3u : 0u;            /* 3 = tail */
+      return emit_token(lex, kind, kavak_span_from_to(fragment_start, lex->pos), v) == 0
                ? SCAN_MATCHED : SCAN_OOM;
     }
 
-    if (is_template && match_lit(lex, rule->interp_open)) {
+    if (is_template && match_lit(lex, rule->interp_open) &&
+        interp_marker_starts_interpolation(lex, rule)) {
       const uint32_t interp_start = lex->pos;
+      had_interp = 1;
       if (fragment_start < interp_start) {
-        if (emit_token(lex, KAVAK_TOK_STRING,
-                       kavak_span_from_to(fragment_start, interp_start), 0) != 0) {
+        uint32_t fragment_kind = KAVAK_TOK_STRING;
+        uint32_t fragment_v = 0;
+        if (rule->fragment_kind != 0) {
+          fragment_kind = rule->fragment_kind;
+          fragment_v = fragment_start == start ? 1u : 2u; /* head : interior */
+        }
+        if (emit_token(lex, fragment_kind,
+                       kavak_span_from_to(fragment_start, interp_start),
+                       fragment_v) != 0) {
           return SCAN_OOM;
         }
       }
@@ -629,11 +838,12 @@ static ScanResult try_scan_string(Lexer *lex) {
  * part of the comment, the body nests when `rule.nest` is set, and running
  * off the end without closing is recoverable (INVALID + diag at EOF).
  *
- * Doc comments (`is_doc`) emit a KAVAK_TOK_COMMENT spanning the whole
- * comment when config.keep_doc_comments is set; any other comment is
- * skipped silently (MATCHED, no token). When several rules could open
- * here the longest `open` wins — a "///" doc rule beats a "//" line rule —
- * so config order does not affect matching. */
+ * With config.keep_comments every comment emits a KAVAK_TOK_COMMENT
+ * spanning the whole comment; with config.keep_doc_comments only the
+ * `is_doc` rules do. Any other comment is skipped silently (MATCHED, no
+ * token). When several rules could open here the longest `open` wins —
+ * a "///" doc rule beats a "//" line rule — so config order does not
+ * affect matching. */
 static ScanResult try_scan_comment(Lexer *lex) {
   const KavakLexerConfig *cfg = lex->config;
 
@@ -674,7 +884,7 @@ static ScanResult try_scan_comment(Lexer *lex) {
     }
   }
 
-  if (rule->is_doc && cfg->keep_doc_comments) {
+  if (cfg->keep_comments || (rule->is_doc && cfg->keep_doc_comments)) {
     const KavakSpan span = kavak_span_from_to(start, lex->pos);
     return emit_token(lex, KAVAK_TOK_COMMENT, span, 0) == 0 ? SCAN_MATCHED
                                                             : SCAN_OOM;
@@ -725,7 +935,7 @@ static ScanResult try_scan_operator(Lexer *lex) {
     const uint32_t start = lex->pos;
     lex->pos += (uint32_t)strlen(op->text);
     return emit_token(lex, KAVAK_TOK_OP, kavak_span_from_to(start, lex->pos),
-                      op->op_id) == 0 ? SCAN_MATCHED : SCAN_OOM;
+                      op->id) == 0 ? SCAN_MATCHED : SCAN_OOM;
   }
 
   if (is_kernel_punct(peek(lex))) {
@@ -813,23 +1023,36 @@ static int handle_offside_line_start(Lexer *lex) {
 
   if (col > current) {
     if (lex->indent_top + 1u >= KAVAK_MAX_INDENT_DEPTH) {
+      /* Recoverable: over-deep nesting is a syntax error, not OOM. Record the
+       * diagnostic and keep lexing at the current depth (no INDENT pushed) so
+       * the rest of the file stays analyzable. -1 stays reserved for OOM /
+       * token-push failure, per the kavak_analyze "NULL only on OOM" contract. */
       push_diag(lex, kavak_span_make(point, 0), "indentation nesting too deep");
-      return -1;
+      return 0;
     }
     lex->indent_stack[++lex->indent_top] = col;
     return emit_indent_token(lex, KAVAK_TOK_INDENT, point);
   }
 
-  while (lex->indent_top > 0u &&
-         (col < lex->indent_stack[lex->indent_top] ||
-          (cfg->dedent_on_lower_or_equal &&
-           col == lex->indent_stack[lex->indent_top]))) {
+  /* Strict dedents: pop every level strictly deeper than this column. */
+  while (lex->indent_top > 0u && col < lex->indent_stack[lex->indent_top]) {
     lex->indent_top--;
+    if (emit_indent_token(lex, KAVAK_TOK_DEDENT, point) != 0) return -1;
+  }
+  /* Haskell-style equal-column close: pop the matching level exactly once. This
+   * is a deliberate dedent, not a misalignment, so it must not trip the
+   * misaligned-dedent diagnostic below (which compares against the *enclosing*
+   * level after the pop). */
+  int closed_equal = 0;
+  if (cfg->dedent_on_lower_or_equal && lex->indent_top > 0u &&
+      col == lex->indent_stack[lex->indent_top]) {
+    lex->indent_top--;
+    closed_equal = 1;
     if (emit_indent_token(lex, KAVAK_TOK_DEDENT, point) != 0) return -1;
   }
 
   current = lex->indent_stack[lex->indent_top];
-  if (col != current) {
+  if (!closed_equal && col != current) {
     push_diag(lex, kavak_span_make(point, 0), "misaligned dedent");
   }
   return 0;
@@ -849,7 +1072,11 @@ static int finish_physical_line(Lexer *lex) {
   const uint32_t newline_len = newline_len_at(lex, start);
 
   if (maybe_emit_auto_semicolon(lex, start) != 0) return -1;
-  if (lex->config->offside && lex->line_has_significant) {
+  /* Offside NEWLINEs are gated on the line having a significant token;
+   * emit_newlines is ungated — every physical newline emits, blank and
+   * comment-only lines included. */
+  if (lex->config->emit_newlines ||
+      (lex->config->offside && lex->line_has_significant)) {
     if (emit_token(lex, KAVAK_TOK_NEWLINE, kavak_span_make(start, newline_len), 0) != 0) {
       return -1;
     }
@@ -872,6 +1099,8 @@ static int drain_indentation(Lexer *lex, const uint32_t pos) {
 static int finish_eof_layout(Lexer *lex) {
   const uint32_t pos = lex->pos;
   if (maybe_emit_auto_semicolon(lex, pos) != 0) return -1;
+  /* The virtual len-0 NEWLINE at EOF is offside-only; emit_newlines
+   * covers physical newlines and adds nothing here. */
   if (lex->config->offside && lex->line_has_significant) {
     if (emit_token(lex, KAVAK_TOK_NEWLINE, kavak_span_make(pos, 0), 0) != 0) return -1;
   }
@@ -902,9 +1131,18 @@ int kavak_lex(const KavakSource      *source,
     .line_has_significant = 0,
   };
 
-  const int newline_aware = config->offside || config->auto_semi;
+  const int newline_aware = config->offside || config->auto_semi ||
+                            config->emit_newlines;
 
   for (;;) {
+    /* Reserve headroom at the token-count ceiling so the closing layout
+     * (drained DEDENTs + NEWLINE) and the final EOF token always fit; otherwise
+     * a pathological >4G-token source could fail the EOF push like an OOM. */
+    if (out_tokens->count >= UINT32_MAX - (KAVAK_MAX_INDENT_DEPTH + 4u)) {
+      push_diag(&lex, kavak_span_make(lex.pos, 0),
+                "source exceeds the token limit; truncated");
+      break;
+    }
     if (newline_aware) {
       if (lex.at_line_start && handle_offside_line_start(&lex) != 0) return -1;
       skip_inline_whitespace(&lex);

@@ -5,11 +5,14 @@
  */
 
 #include "kavak.h"
+#include "kavak_internal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define KAVAK_PARSER_MAX_EXPR_DEPTH 512u
+/* Shares the single KAVAK_RECURSION_LIMIT with the type-graph traversal guard. */
+#define KAVAK_PARSER_MAX_EXPR_DEPTH KAVAK_RECURSION_LIMIT
 
 struct KavakParser {
   const KavakSource *source;
@@ -48,7 +51,7 @@ static const KavakOperator *operator_for_token(const KavakParser *parser,
   if (!parser->config.operators) return NULL;
   for (uint32_t i = 0; i < parser->config.operator_count; ++i) {
     const KavakOperator *op = &parser->config.operators[i];
-    if (op->op_id == token->v && (op->flags & flag)) return op;
+    if (op->id == token->v && (op->flags & flag)) return op;
   }
   return NULL;
 }
@@ -93,6 +96,19 @@ const KavakToken *kavak_parser_peek(const KavakParser *parser) {
   return &parser->tokens[parser->pos];
 }
 
+const KavakToken *kavak_parser_peek_at(const KavakParser *parser,
+                                       const uint32_t offset) {
+  if (!parser || parser->token_count == 0) return NULL;
+  if (parser->pos >= parser->token_count) {
+    return &parser->tokens[parser->token_count - 1u];
+  }
+  /* Compare against the remaining count so pos + offset can never overflow. */
+  const uint32_t remaining = parser->token_count - parser->pos;  /* >= 1 */
+  const uint32_t index = offset < remaining ? parser->pos + offset
+                                            : parser->token_count - 1u;
+  return &parser->tokens[index];
+}
+
 const KavakToken *kavak_parser_previous(const KavakParser *parser) {
   if (!parser || parser->pos == 0 || parser->token_count == 0) return NULL;
   const uint32_t i = parser->pos - 1u;
@@ -106,6 +122,10 @@ uint32_t kavak_parser_pos(const KavakParser *parser) {
 int kavak_parser_at_end(const KavakParser *parser) {
   const KavakToken *token = kavak_parser_peek(parser);
   return !token || token->kind == KAVAK_TOK_EOF;
+}
+
+int kavak_parser_progressed(const KavakParser *parser, const uint32_t prev_pos) {
+  return parser && parser->pos > prev_pos;
 }
 
 int kavak_parser_check(const KavakParser *parser, const uint32_t kind) {
@@ -205,6 +225,35 @@ void kavak_parser_recover_to(KavakParser *parser, const uint32_t *kinds,
   }
 }
 
+static int recovery_targets_match(const KavakToken *token,
+                                  const KavakRecoveryTarget *targets,
+                                  const uint32_t count) {
+  if (!token) return 0;
+  if (token->kind == KAVAK_TOK_PUNCT &&
+      (token->v == '(' || token->v == '[' || token->v == '{')) {
+    return 0;  /* never stop on an opening bracket; depth handles nesting */
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    if (token->kind != targets[i].kind) continue;
+    if (targets[i].match_v && token->v != targets[i].v) continue;
+    return 1;
+  }
+  return 0;
+}
+
+void kavak_parser_recover_to_targets(KavakParser *parser,
+                                     const KavakRecoveryTarget *targets,
+                                     const uint32_t count) {
+  if (!parser) return;
+  uint32_t depth = 0;
+  while (!kavak_parser_at_end(parser)) {
+    const KavakToken *token = kavak_parser_peek(parser);
+    if (depth == 0 && recovery_targets_match(token, targets, count)) return;
+    recovery_update_depth(token, &depth);
+    (void)parser_advance(parser);
+  }
+}
+
 static KavakASTNode *parser_make_node_at(KavakParser *parser,
                                          const uint32_t kind,
                                          const uint32_t first_token) {
@@ -222,35 +271,35 @@ KavakASTNode *kavak_parser_make_node(KavakParser *parser, const uint32_t kind) {
   return parser_make_node_at(parser, kind, parser ? parser->pos : 0);
 }
 
-static KavakSpan span_for_token_range(const KavakParser *parser,
-                                      const uint32_t first,
-                                      const uint32_t last_exclusive) {
-  KavakSpan span = KAVAK_SPAN_NONE;
-  if (!parser || first >= parser->token_count) return span;
-  const uint32_t end = last_exclusive < parser->token_count
-                     ? last_exclusive
-                     : parser->token_count;
-  for (uint32_t i = first; i < end; ++i) {
-    if (parser->tokens[i].kind == KAVAK_TOK_EOF) continue;
-    span = kavak_span_union(span, parser->tokens[i].span);
-  }
-  return span;
-}
-
 void kavak_parser_finish_node(KavakParser *parser, KavakASTNode *node) {
   if (!parser || !node) return;
 
-  const uint32_t first = node->payload.range.first_token;
-  const uint32_t last = parser->pos > first ? parser->pos : first + 1u;
-  node->payload.range.last_token = last > 0 ? last - 1u : first;
+  /* Anchor on node->span — a DEDICATED field set to the first token at
+   * make_node time — never the payload union. Reading the union here would let
+   * a descriptor that populates payload.{user,op,literal,...} between make_node
+   * and finish_node silently corrupt first_token and the computed span; using
+   * node->span removes that foot-gun entirely (and matches how descriptors such
+   * as examples/tinylang.c already capture the start span).
+   *
+   * The full span = first token .. last consumed token, unioned with every
+   * child. Tokens are contiguous, so unioning the two endpoints reproduces the
+   * whole token range; kavak_span_union ignores empty spans, so trailing EOF
+   * tokens contribute nothing. The `.start` guard drops a candidate that
+   * precedes this node (i.e. when no token was consumed past the first). */
+  KavakSpan span = node->span;
 
-  KavakSpan child_span = KAVAK_SPAN_NONE;
-  for (KavakASTNode *child = node->first_child; child; child = child->next_sibling) {
-    child_span = kavak_span_union(child_span, child->span);
+  uint32_t end = parser->pos;
+  if (end > parser->token_count) end = parser->token_count;
+  while (end > 0 && parser->tokens[end - 1u].kind == KAVAK_TOK_EOF) --end;
+  if (end > 0) {
+    const KavakSpan last = parser->tokens[end - 1u].span;
+    if (last.start >= span.start) span = kavak_span_union(span, last);
   }
 
-  const KavakSpan token_span = span_for_token_range(parser, first, last);
-  node->span = kavak_span_union(token_span, child_span);
+  for (KavakASTNode *child = node->first_child; child; child = child->next_sibling) {
+    span = kavak_span_union(span, child->span);
+  }
+  node->span = span;
 }
 
 KavakParserCheckpoint kavak_parser_checkpoint(const KavakParser *parser) {
@@ -336,10 +385,17 @@ static KavakASTNode *parse_prefix_expr(KavakParser *parser) {
     KavakASTNode *rhs = kavak_parse_expression(parser, prefix->prec);
     if (!node) return NULL;
     node->payload.op.op_token = op_token;
-    node->payload.op.op_id = prefix->op_id;
+    node->payload.op.op_id = prefix->id;
     kavak_ast_append_child(node, rhs);
     node->span = kavak_span_union(parser->tokens[op_token].span, rhs ? rhs->span : KAVAK_SPAN_NONE);
     return node;
+  }
+
+  /* Language-contributed atoms (if/when/lambda/...) — only when no built-in
+   * atom matched. The hook consumes its tokens on success, nothing on NULL. */
+  if (parser->config.parse_primary) {
+    KavakASTNode *atom = parser->config.parse_primary(parser);
+    if (atom) return atom;
   }
 
   return make_error_node(parser, "expected expression");
@@ -359,6 +415,24 @@ KavakASTNode *kavak_parse_expression(KavakParser *parser, const uint16_t min_pre
   }
 
   for (;;) {
+    /* Language-contributed trailing forms (call/index) bind tighter than any
+     * operator, so try them first. A non-NULL result that consumed input
+     * becomes the new lhs; a non-NULL result with no progress is a misbehaving
+     * hook — stop rather than spin. NULL means "did not apply": fall through. */
+    if (parser->config.parse_postfix) {
+      const KavakParserCheckpoint mark = kavak_parser_checkpoint(parser);
+      KavakASTNode *ext = parser->config.parse_postfix(parser, lhs);
+      if (ext && parser->pos > mark.pos) { lhs = ext; continue; }
+      if (ext) break;
+      /* Contract: a NULL ("did not apply") result must consume nothing. A hook
+       * that breaks this would leave operator parsing at the wrong position —
+       * trap it in debug builds, and rewind defensively (position + diags) so a
+       * release build cannot mis-parse off a misbehaving descriptor. */
+      assert(parser->pos == mark.pos &&
+             "parse_postfix returned NULL after consuming tokens");
+      if (parser->pos != mark.pos) kavak_parser_rewind(parser, mark);
+    }
+
     const KavakToken *token = kavak_parser_peek(parser);
     const KavakOperator *postfix = operator_for_token(parser, token, KAVAK_OP_FLAG_POSTFIX);
     if (postfix && postfix->prec >= min_prec && !(postfix->flags & KAVAK_OP_FLAG_INFIX)) {
@@ -370,7 +444,7 @@ KavakASTNode *kavak_parse_expression(KavakParser *parser, const uint16_t min_pre
         break;
       }
       node->payload.op.op_token = op_token;
-      node->payload.op.op_id = postfix->op_id;
+      node->payload.op.op_id = postfix->id;
       kavak_ast_append_child(node, lhs);
       node->span = kavak_span_union(lhs->span, parser->tokens[op_token].span);
       lhs = node;
@@ -382,6 +456,38 @@ KavakASTNode *kavak_parse_expression(KavakParser *parser, const uint16_t min_pre
 
     const uint32_t op_token = parser->pos;
     (void)parser_advance(parser);
+
+    if (infix->flags & KAVAK_OP_FLAG_SELECTOR) {
+      const KavakToken *next = kavak_parser_peek(parser);
+      if (next && next->kind == KAVAK_TOK_IDENT) {
+        uint32_t rhs_token_idx = parser->pos;
+        (void)parser_advance(parser);
+        KavakASTNode *node = kavak_parser_make_node(parser, KAVAK_AST_SELECTOR);
+        if (!node) {
+          lhs = NULL;
+          break;
+        }
+        node->payload.user.a = rhs_token_idx;
+        kavak_ast_append_child(node, lhs);
+        node->span = kavak_span_union(lhs->span, parser->tokens[rhs_token_idx].span);
+        lhs = node;
+      } else {
+        parser_diag(parser, next ? next->span : KAVAK_SPAN_NONE, "expected identifier after selector");
+        KavakASTNode *err_node = kavak_parser_make_node(parser, KAVAK_AST_ERROR);
+        if (err_node) {
+          err_node->modifiers |= KAVAK_AST_FLAG_ERROR;
+          err_node->span = kavak_span_union(lhs->span, next ? next->span : KAVAK_SPAN_NONE);
+        }
+        /* Consume the offending token so an outer descriptor parse loop always
+         * makes progress (mirrors make_error_node) — otherwise `a.<bad>` could
+         * be re-parsed from the same position forever. */
+        if (!kavak_parser_at_end(parser)) (void)parser_advance(parser);
+        lhs = err_node;
+        break;
+      }
+      continue;
+    }
+
     KavakASTNode *rhs = kavak_parse_expression(parser, next_min_prec(infix));
     KavakASTNode *node = kavak_parser_make_node(parser, KAVAK_AST_BINARY);
     if (!node) {
@@ -389,7 +495,7 @@ KavakASTNode *kavak_parse_expression(KavakParser *parser, const uint16_t min_pre
       break;
     }
     node->payload.op.op_token = op_token;
-    node->payload.op.op_id = infix->op_id;
+    node->payload.op.op_id = infix->id;
     kavak_ast_append_child(node, lhs);
     kavak_ast_append_child(node, rhs);
     node->span = kavak_span_union(lhs->span, rhs ? rhs->span : KAVAK_SPAN_NONE);
@@ -405,4 +511,51 @@ KavakASTNode *kavak_parse_expression(KavakParser *parser, const uint16_t min_pre
 
   parser->expr_depth--;
   return lhs;
+}
+
+uint32_t kavak_parser_parse_delimited(KavakParser *parser, KavakASTNode *node,
+                                      const char open, const char sep,
+                                      const char close) {
+  if (!parser || !node) return 0;
+  const char open_s[2]  = { open, 0 };
+  const char sep_s[2]   = { sep, 0 };
+  const char close_s[2] = { close, 0 };
+
+  if (!kavak_parser_eat_text(parser, KAVAK_TOK_PUNCT, open_s)) return 0;
+
+  uint32_t count = 0;
+  if (!kavak_parser_check_text(parser, KAVAK_TOK_PUNCT, close_s)) {
+    for (;;) {
+      const uint32_t mark = parser->pos;
+      KavakASTNode *item = kavak_parse_expression(parser, 0);
+      if (item) {
+        kavak_ast_append_child(node, item);
+        ++count;
+      }
+      /* If the element parse consumed nothing we would loop forever; stop. */
+      if (!kavak_parser_progressed(parser, mark)) break;
+      if (!kavak_parser_eat_text(parser, KAVAK_TOK_PUNCT, sep_s)) break;
+      /* Tolerate a trailing separator before the close. */
+      if (kavak_parser_check_text(parser, KAVAK_TOK_PUNCT, close_s)) break;
+    }
+  }
+
+  (void)kavak_parser_expect_text(parser, KAVAK_TOK_PUNCT, close_s,
+                                 "expected closing delimiter");
+  return count;
+}
+
+KavakASTNode *kavak_parser_parse_call(KavakParser *parser, KavakASTNode *callee,
+                                      const char open, const char sep,
+                                      const char close) {
+  if (!parser || !callee) return NULL;
+  const char open_s[2] = { open, 0 };
+  if (!kavak_parser_check_text(parser, KAVAK_TOK_PUNCT, open_s)) return NULL;
+
+  KavakASTNode *call = kavak_parser_make_node(parser, KAVAK_AST_CALL);
+  if (!call) return NULL;
+  kavak_ast_append_child(call, callee);
+  (void)kavak_parser_parse_delimited(parser, call, open, sep, close);
+  kavak_parser_finish_node(parser, call);
+  return call;
 }

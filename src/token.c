@@ -29,7 +29,12 @@ int kavak_token_vec_reserve(KavakTokenVec *vector, const uint32_t n) {
   if (vector->cap >= n) return 0;
   uint32_t new_cap = vector->cap ? vector->cap : 16;
   while (new_cap < n) {
-    if (new_cap > UINT32_MAX / 2u) return -1;
+    if (new_cap > UINT32_MAX / 2u) {  /* doubling would overflow: clamp to the
+                                       * exact request so the vec can still grow
+                                       * up to UINT32_MAX, not just 2^31. */
+      new_cap = n;
+      break;
+    }
     new_cap *= 2u;
   }
   if ((size_t)new_cap > SIZE_MAX / sizeof(KavakToken)) return -1;

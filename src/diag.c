@@ -56,7 +56,7 @@ uint32_t kavak_diag_error_count(const KavakDiagVec *vector) {
   return n;
 }
 
-static const char *kavak__sev_word(const KavakSeverity severity) {
+static const char *sev_word(const KavakSeverity severity) {
   switch (severity) {
     case KAVAK_SEV_ERROR:   return "error";
     case KAVAK_SEV_WARNING: return "warning";
@@ -82,7 +82,7 @@ size_t kavak_diag_format(const KavakDiag *diag, const KavakSource *source,
    * size_t is safe; pre-flight (buf==NULL, buf_len==0) is C99 standard. */
   const int n = snprintf(buf, buf_len, "%s:%u:%u: %s: %s\n",
                           filename, line, col,
-                          kavak__sev_word(diag->severity),
+                          sev_word(diag->severity),
                           diag->message ? diag->message : "");
   return n < 0 ? 0 : (size_t)n;
 }

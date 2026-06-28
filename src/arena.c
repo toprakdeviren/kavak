@@ -27,21 +27,21 @@ struct KavakArenaChunk {
   unsigned char    data[];
 };
 
-static KavakArenaChunk *kavak__chunk_new(const size_t cap) {
+static KavakArenaChunk *chunk_new(const size_t cap) {
   if (cap > SIZE_MAX - sizeof(KavakArenaChunk)) return NULL;
   KavakArenaChunk *chunk = calloc(1, sizeof(*chunk) + cap);
   if (chunk) chunk->cap = cap;
   return chunk;
 }
 
-static int kavak__add_overflows_size(const size_t a, const size_t b,
+static int add_overflows_size(const size_t a, const size_t b,
                                      size_t *out) {
   if (a > SIZE_MAX - b) return 1;
   if (out) *out = a + b;
   return 0;
 }
 
-static int kavak__align_forward(const uintptr_t base, const size_t align,
+static int align_forward(const uintptr_t base, const size_t align,
                                 uintptr_t *out) {
   if (align == 0 || (align & (align - 1u)) != 0) return -1;
   if (align - 1u > (size_t)(UINTPTR_MAX - base)) return -1;
@@ -54,7 +54,7 @@ void kavak_arena_init(KavakArena *arena, size_t chunk_size) {
   if (chunk_size == 0) chunk_size = KAVAK_ARENA_DEFAULT_CHUNK;
   arena->chunk_size = chunk_size;
   arena->total_used = 0;
-  arena->head = arena->tail = kavak__chunk_new(chunk_size);
+  arena->head = arena->tail = chunk_new(chunk_size);
   /* On OOM head=tail=NULL — alloc returns NULL, free is a no-op. */
 }
 
@@ -65,39 +65,41 @@ void *kavak_arena_alloc_aligned(KavakArena *arena, const size_t size, size_t ali
   KavakArenaChunk *tail = arena->tail;
   uintptr_t base    = (uintptr_t)tail->data + tail->used;
   uintptr_t aligned = 0;
-  if (kavak__align_forward(base, align, &aligned) != 0) return NULL;
+  if (align_forward(base, align, &aligned) != 0) return NULL;
   size_t    pad     = (size_t)(aligned - base);
 
   size_t used_with_pad = 0;
   size_t used_needed = 0;
-  if (kavak__add_overflows_size(tail->used, pad, &used_with_pad) ||
-      kavak__add_overflows_size(used_with_pad, size, &used_needed)) {
+  if (add_overflows_size(tail->used, pad, &used_with_pad) ||
+      add_overflows_size(used_with_pad, size, &used_needed)) {
     return NULL;
   }
 
   if (used_needed > tail->cap) {
     /* Need a new chunk. Big asks get a chunk sized to fit; reserve
-     * extra so the requested alignment can always be satisfied even
-     * when data[0] of the new chunk isn't `align`-aligned itself. */
-    const size_t extra = align > KAVAK_ARENA_DEFAULT_ALIGN ? align : 0;
+     * worst-case padding (align-1) so the requested alignment can always be
+     * satisfied even when data[0] of the new chunk isn't `align`-aligned
+     * itself — which happens for the default 8-byte align on ILP32/wasm32,
+     * where the chunk header is only 12 bytes (data[0] at offset 4 mod 8). */
+    const size_t extra = align - 1u;
     size_t need = 0;
-    if (kavak__add_overflows_size(size, extra, &need)) return NULL;
+    if (add_overflows_size(size, extra, &need)) return NULL;
     const size_t cap  = arena->chunk_size > need ? arena->chunk_size : need;
-    KavakArenaChunk *fresh = kavak__chunk_new(cap);
+    KavakArenaChunk *fresh = chunk_new(cap);
     if (!fresh) return NULL;
     tail->next = fresh;
     arena->tail = tail = fresh;
 
     base    = (uintptr_t)tail->data;
-    if (kavak__align_forward(base, align, &aligned) != 0) return NULL;
+    if (align_forward(base, align, &aligned) != 0) return NULL;
     pad     = (size_t)(aligned - base);
   }
 
   size_t used_delta = 0;
   size_t total_used = 0;
-  if (kavak__add_overflows_size(pad, size, &used_delta) ||
+  if (add_overflows_size(pad, size, &used_delta) ||
       used_delta > tail->cap ||
-      kavak__add_overflows_size(arena->total_used, used_delta, &total_used)) {
+      add_overflows_size(arena->total_used, used_delta, &total_used)) {
     return NULL;
   }
 

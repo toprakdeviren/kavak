@@ -47,6 +47,7 @@ static const char *token_text_ptr(const KavakSema *sema, const KavakToken *token
 }
 
 static KavakASTNode *walk_resolve(KavakSema *sema, KavakASTNode *node);
+static void walk_declare(KavakSema *sema, KavakASTNode *node);
 
 KavakSema *kavak_sema_new(KavakSession *session,
                           const KavakSource *source,
@@ -120,7 +121,7 @@ void kavak_sema_pop_scope(KavakSema *sema) {
 
 int kavak_sema_bind(KavakSema *sema, KavakSymbol symbol) {
   if (!sema || !sema->scope || !symbol.name) return -1;
-  if (symbol.name_len == 0) symbol.name_len = (uint32_t)strlen(symbol.name);
+  symbol.name_len = name_len_or_strlen(symbol.name, symbol.name_len);
   if (sema->scope->count == sema->scope->cap) {
     if (sema->scope->count == UINT32_MAX) return -1;
     if (sema->scope->cap > UINT32_MAX / 2u) return -1;
@@ -162,6 +163,63 @@ const KavakSymbol *kavak_sema_lookup(const KavakSema *sema,
     }
   }
   return NULL;
+}
+
+uint32_t kavak_sema_lookup_all(const KavakSema *sema, const char *name,
+                               const uint32_t name_len,
+                               KavakSymbolVisitFn visit, void *user) {
+  if (!sema || !name || !visit) return 0;
+  const uint32_t len = name_len_or_strlen(name, name_len);
+  uint32_t visited = 0;
+  for (const KavakScope *scope = sema->scope; scope; scope = scope->parent) {
+    for (uint32_t i = scope->count; i > 0; --i) {
+      const KavakSymbol *symbol = &scope->symbols[i - 1u];
+      if (name_eq(symbol, name, len)) {
+        ++visited;
+        if (visit(symbol, user) != 0) return visited;
+      }
+    }
+  }
+  return visited;
+}
+
+typedef struct PickOverloadCtx {
+  KavakScoreOverloadFn        score;
+  void                       *user;
+  const KavakTypeInfo *const *arg_types;
+  uint32_t                    arg_count;
+  const KavakSymbol          *best;
+  int                         best_score;
+} PickOverloadCtx;
+
+static int pick_overload_visit(const KavakSymbol *symbol, void *user) {
+  PickOverloadCtx *ctx = user;
+  const int s = ctx->score(symbol, ctx->arg_types, ctx->arg_count, ctx->user);
+  /* >= 0 accepts; strict > keeps the first (newest) candidate on ties. */
+  if (s >= 0 && (!ctx->best || s > ctx->best_score)) {
+    ctx->best = symbol;
+    ctx->best_score = s;
+  }
+  return 0;  /* visit every candidate */
+}
+
+const KavakSymbol *kavak_sema_pick_overload(const KavakSema *sema,
+                                            const char *name,
+                                            const uint32_t name_len,
+                                            KavakScoreOverloadFn score, void *user,
+                                            const KavakTypeInfo *const *arg_types,
+                                            const uint32_t arg_count) {
+  if (!sema || !name || !score) return NULL;
+  PickOverloadCtx ctx = {
+    .score = score,
+    .user = user,
+    .arg_types = arg_types,
+    .arg_count = arg_count,
+    .best = NULL,
+    .best_score = 0,
+  };
+  (void)kavak_sema_lookup_all(sema, name, name_len, pick_overload_visit, &ctx);
+  return ctx.best;
 }
 
 int kavak_sema_apply_narrowings(KavakSema *sema,
@@ -286,14 +344,48 @@ static KavakASTNode *walk_resolve(KavakSema *sema, KavakASTNode *node) {
   for (KavakASTNode *child = node->first_child; child; child = child->next_sibling) {
     (void)walk_resolve(sema, child);
   }
+  /* Post-order: children are resolved, so the language can now synthesize this
+   * node's type from theirs (and pop any scope it pushed in resolve_node). */
+  if (sema && sema->language && sema->language->resolve_node_post) {
+    KavakTypeInfo *synthesized = sema->language->resolve_node_post(sema, node);
+    if (synthesized) node->type = synthesized;
+  }
   if (sema) sema->resolve_depth--;
   return node;
 }
 
+/* First traversal: let the language forward-register declarations so the
+ * resolve walk can see names regardless of source order. Pure tree walk; the
+ * descriptor's declare_node hook owns all "what is a declaration" knowledge. */
+static void walk_declare(KavakSema *sema, KavakASTNode *node) {
+  if (!node) return;
+  if (sema && sema->resolve_depth >= KAVAK_SEMA_MAX_RESOLVE_DEPTH) {
+    node->modifiers |= KAVAK_AST_FLAG_ERROR;
+    kavak_sema_diag(sema, node->span, "AST nesting too deep");
+    return;
+  }
+  if (sema) sema->resolve_depth++;
+  if (sema && sema->language && sema->language->declare_node) {
+    if (sema->language->declare_node(sema, node) != 0) {
+      node->modifiers |= KAVAK_AST_FLAG_ERROR;
+    }
+  }
+  for (KavakASTNode *child = node->first_child; child; child = child->next_sibling) {
+    walk_declare(sema, child);
+  }
+  if (sema) sema->resolve_depth--;
+}
+
 int kavak_sema_resolve_names(KavakSema *sema, KavakASTNode *root) {
   if (!sema) return -1;
+  KavakASTNode *target = root ? root : sema->root;
+  /* Optional declaration pre-pass for forward references. */
+  if (sema->language && sema->language->declare_node) {
+    sema->resolve_depth = 0;
+    walk_declare(sema, target);
+  }
   sema->resolve_depth = 0;
-  (void)walk_resolve(sema, root ? root : sema->root);
+  (void)walk_resolve(sema, target);
   sema->resolve_depth = 0;
   return 0;
 }

@@ -50,6 +50,29 @@ static int run_lex(const char *bytes, KavakTokenVec *tokens, KavakDiagVec *diags
   return rc;
 }
 
+/* Haskell-style layout: a line at the same column as the current block closes
+ * it (dedent on lower-OR-equal). */
+static const KavakOffsideConfig LE_OFFSIDE = {
+  .unit = KAVAK_INDENT_SPACES,
+  .dedent_on_lower_or_equal = 1,
+};
+
+static const KavakLexerConfig LE_CONFIG = {
+  .keywords      = PY_KEYWORDS,
+  .keyword_count = sizeof(PY_KEYWORDS) / sizeof(*PY_KEYWORDS),
+  .comments      = PY_COMMENTS,
+  .comment_count = sizeof(PY_COMMENTS) / sizeof(*PY_COMMENTS),
+  .offside       = &LE_OFFSIDE,
+};
+
+static int run_lex_le(const char *bytes, KavakTokenVec *tokens, KavakDiagVec *diags) {
+  KavakSource source;
+  if (kavak_source_init(&source, bytes, strlen(bytes), "<offside-le-test>") != 0) return -1;
+  const int rc = kavak_lex(&source, &LE_CONFIG, tokens, diags);
+  kavak_source_free(&source);
+  return rc;
+}
+
 static int test_python_offside_smoke(void) {
   static const uint32_t expected[] = {
     KAVAK_TOK_KEYWORD, KAVAK_TOK_IDENT, KAVAK_TOK_PUNCT, KAVAK_TOK_NEWLINE,
@@ -134,7 +157,7 @@ static int test_misaligned_dedent_reports_diag(void) {
   return 0;
 }
 
-static int test_indent_depth_overflow_is_fatal(void) {
+static int test_indent_depth_overflow_is_recoverable(void) {
   enum { LEVELS = 130, BUF_SIZE = (LEVELS * (LEVELS + 1)) / 2 + LEVELS * 10 + 1 };
   char src[BUF_SIZE];
   size_t pos = 0;
@@ -148,7 +171,10 @@ static int test_indent_depth_overflow_is_fatal(void) {
   KavakTokenVec tokens; kavak_token_vec_init(&tokens);
   KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
 
-  ASSERT(run_lex(src, &tokens, &diags) == -1, "deep indent is fatal");
+  /* Over-deep nesting is a recoverable lexical error: kavak_lex returns 0 with
+   * a diagnostic (and a best-effort token stream), not -1. -1 is reserved for
+   * OOM, per the "NULL only on OOM" analyze contract. */
+  ASSERT(run_lex(src, &tokens, &diags) == 0, "deep indent is recoverable");
   int found = 0;
   for (uint32_t i = 0; i < diags.count; ++i) {
     if (strcmp(diags.items[i].message, "indentation nesting too deep") == 0) {
@@ -163,15 +189,45 @@ static int test_indent_depth_overflow_is_fatal(void) {
   return 0;
 }
 
+/* Regression: with dedent_on_lower_or_equal, an equal-column line closes the
+ * block with a single DEDENT and must NOT also raise a spurious "misaligned
+ * dedent" (the pre-fix code over-popped, then compared against the enclosing
+ * level and flagged a false misalignment). */
+static int test_equal_column_dedent_no_spurious_misalign(void) {
+  const char *src =
+    "a:\n"
+    "    b\n"
+    "    c";
+
+  KavakTokenVec tokens; kavak_token_vec_init(&tokens);
+  KavakDiagVec  diags;  kavak_diag_vec_init(&diags);
+
+  ASSERT(run_lex_le(src, &tokens, &diags) == 0, "rc 0");
+  int dedents = 0;
+  for (uint32_t i = 0; i < tokens.count; ++i) {
+    if (tokens.items[i].kind == KAVAK_TOK_DEDENT) dedents++;
+  }
+  ASSERT(dedents == 1, "equal-column line closes the block with one DEDENT");
+  for (uint32_t i = 0; i < diags.count; ++i) {
+    ASSERT(strcmp(diags.items[i].message, "misaligned dedent") != 0,
+           "equal-column close must not be flagged misaligned");
+  }
+
+  kavak_diag_vec_free(&diags);
+  kavak_token_vec_free(&tokens);
+  return 0;
+}
+
 int main(void) {
   int fails = 0;
   fails += test_python_offside_smoke();
+  fails += test_equal_column_dedent_no_spurious_misalign();
   fails += test_comment_only_line_does_not_indent();
   fails += test_misaligned_dedent_reports_diag();
-  fails += test_indent_depth_overflow_is_fatal();
+  fails += test_indent_depth_overflow_is_recoverable();
 
   if (fails == 0) {
-    printf("  ✓ test_lexer_offside: 4/4 passed\n");
+    printf("  ✓ test_lexer_offside: 5/5 passed\n");
     return 0;
   }
   fprintf(stderr, "  ✗ test_lexer_offside: %d failure(s)\n", fails);

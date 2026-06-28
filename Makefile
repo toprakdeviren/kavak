@@ -8,6 +8,10 @@
 #   make wasm           build a wasm-ready static libkavak.a
 #   make examples       build runnable examples
 #   make clean          remove build artifacts
+#
+# kavak is self-contained: Unicode identifier classification is backed by a
+# generated XID table (src/unicode_xid.c, see scripts/gen_xid_table.py); there
+# is no external Unicode-library dependency.
 
 CC      ?= clang
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic
@@ -20,19 +24,9 @@ SRCDIR    = $(ROOT)src
 TESTDIR   = $(ROOT)tests
 EXAMPLEDIR = $(ROOT)examples
 BUILDDIR  = $(ROOT)build
-DECODER_ROOT ?= $(abspath $(ROOT)../../decoder)
-DECODER_LIB  ?= $(DECODER_ROOT)/build/libunicode.a
-DECODER_WASM_LIB ?= $(DECODER_ROOT)/build/wasm/libunicode.a
-DECODER_LDLIBS ?= -lm -lpthread
-LIBTOOL ?= libtool
 PKG_CONFIG_DIR ?= $(PREFIX)/lib/pkgconfig
-DECODER_WRAPDIR = $(BUILDDIR)/generated/include
-DECODER_WRAP_HEADERS = \
-  $(DECODER_WRAPDIR)/kavak_decoder/core.h \
-  $(DECODER_WRAPDIR)/kavak_decoder/encoding.h \
-  $(DECODER_WRAPDIR)/kavak_decoder/security.h
 
-INCLUDES  = -I$(INCDIR) -I$(DECODER_WRAPDIR)
+INCLUDES  = -I$(INCDIR)
 
 SRCS = \
   $(SRCDIR)/arena.c \
@@ -40,6 +34,7 @@ SRCS = \
   $(SRCDIR)/span.c \
   $(SRCDIR)/diag.c \
   $(SRCDIR)/utf8.c \
+  $(SRCDIR)/unicode_xid.c \
   $(SRCDIR)/token.c \
   $(SRCDIR)/lexer.c \
   $(SRCDIR)/parser.c \
@@ -47,6 +42,7 @@ SRCS = \
   $(SRCDIR)/type.c \
   $(SRCDIR)/sema.c \
   $(SRCDIR)/dump.c \
+  $(SRCDIR)/intern.c \
   $(SRCDIR)/kavak.c
 
 OBJS = $(patsubst $(ROOT)%.c, $(BUILDDIR)/%.o, $(SRCS))
@@ -54,8 +50,8 @@ DEPS = $(OBJS:.o=.d)
 LIB  = $(BUILDDIR)/libkavak.a
 PC   = $(BUILDDIR)/kavak.pc
 
-.PHONY: all debug release test clean decoder-wasm wasm examples sanitize \
-        pkgconfig install FORCE
+.PHONY: all debug release test clean wasm examples sanitize bench tsan \
+        pkgconfig install
 
 all: debug
 
@@ -65,46 +61,14 @@ debug:   $(LIB)
 release: CFLAGS += -O2 -DNDEBUG
 release: $(LIB)
 
-define require_decoder_root
-	@test -d "$(DECODER_ROOT)" || { \
-	  echo "error: DECODER_ROOT not found: $(DECODER_ROOT)" >&2; \
-	  echo "       set DECODER_ROOT=/absolute/path/to/decoder" >&2; \
-	  exit 1; \
-	}
-endef
-
-define merge_native_archive
-	@rm -f $(1)
-	@if command -v "$(LIBTOOL)" >/dev/null 2>&1 && \
-	    "$(LIBTOOL)" -static -o $(1) $(2) $(3) >/dev/null 2>&1; then \
-	  :; \
-	else \
-	  rm -f $(1); \
-	  { \
-	    printf "CRE%s %s\n" "ATE" "$(1)"; \
-	    for obj in $(2); do echo "ADDMOD $$obj"; done; \
-	    echo "ADDLIB $(3)"; \
-	    echo "SAVE"; \
-	    echo "END"; \
-	  } | $(AR) -M; \
-	fi
-endef
-
-$(DECODER_LIB): FORCE
-	$(require_decoder_root)
-	@$(MAKE) -C "$(DECODER_ROOT)" lib
-
-$(DECODER_WRAPDIR)/kavak_decoder/%.h: $(DECODER_ROOT)/include/%.h Makefile
-	@mkdir -p $(dir $@)
-	@printf '#include "%s"\n' "$<" > $@
-
-$(LIB): $(OBJS) $(DECODER_LIB) Makefile
+$(LIB): $(OBJS) Makefile
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "AR" "$(notdir $@)"
-	$(call merge_native_archive,$@,$(OBJS),$(DECODER_LIB))
+	@rm -f $@
+	@$(AR) rcs $@ $(OBJS)
 	@echo "  ✓ libkavak"
 
-$(BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
+$(BUILDDIR)/%.o: $(ROOT)%.c
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "CC" "$(notdir $<)"
 	@$(CC) $(CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
@@ -122,6 +86,7 @@ TEST_SRCS = \
   $(TESTDIR)/test_ast.c \
   $(TESTDIR)/test_type.c \
   $(TESTDIR)/test_sema.c \
+  $(TESTDIR)/test_intern.c \
   $(TESTDIR)/test_lexer.c \
   $(TESTDIR)/test_lexer_offside.c \
   $(TESTDIR)/test_parser.c
@@ -137,7 +102,7 @@ test: debug $(TEST_BINS)
 $(BUILDDIR)/tests/%: $(TESTDIR)/%.c $(LIB)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "LINK" "$(notdir $@)"
-	@$(CC) $(CFLAGS) $(INCLUDES) $< $(LIB) $(DECODER_LDLIBS) -o $@
+	@$(CC) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@
 
 # ── Examples ────────────────────────────────────────────────────────────────
 EXAMPLE_SRCS = \
@@ -149,11 +114,12 @@ examples: debug $(EXAMPLE_BINS)
 $(BUILDDIR)/examples/%: $(EXAMPLEDIR)/%.c $(LIB)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "LINK" "$(notdir $@)"
-	@$(CC) $(CFLAGS) $(INCLUDES) $< $(LIB) $(DECODER_LDLIBS) -o $@
+	@$(CC) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@
 
 # ── Benchmarks ──────────────────────────────────────────────────────────────
 BENCH_SRCS = \
-  $(TESTDIR)/bench_arena.c
+  $(TESTDIR)/bench_arena.c \
+  $(TESTDIR)/bench_lexer.c
 BENCH_BUILDDIR = $(BUILDDIR)/bench
 BENCH_OBJS = $(patsubst $(ROOT)%.c, $(BENCH_BUILDDIR)/%.o, $(SRCS))
 BENCH_DEPS = $(BENCH_OBJS:.o=.d)
@@ -169,15 +135,14 @@ bench: $(BENCH_BINS)
 	  echo ""; \
 	done
 
-.PHONY: bench
-
-$(BENCH_LIB): $(BENCH_OBJS) $(DECODER_LIB) Makefile
+$(BENCH_LIB): $(BENCH_OBJS) Makefile
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "AR" "$(notdir $@)"
-	$(call merge_native_archive,$@,$(BENCH_OBJS),$(DECODER_LIB))
+	@rm -f $@
+	@$(AR) rcs $@ $(BENCH_OBJS)
 	@echo "  ✓ bench libkavak"
 
-$(BENCH_BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
+$(BENCH_BUILDDIR)/%.o: $(ROOT)%.c
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "CC" "$(notdir $<)"
 	@$(CC) $(BENCH_CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
@@ -187,7 +152,7 @@ $(BENCH_BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
 $(BENCH_BUILDDIR)/tests/%: $(TESTDIR)/%.c $(BENCH_LIB)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "LINK" "$(notdir $@)"
-	@$(CC) $(BENCH_CFLAGS) $(INCLUDES) $< $(BENCH_LIB) $(DECODER_LDLIBS) -o $@
+	@$(CC) $(BENCH_CFLAGS) $(INCLUDES) $< $(BENCH_LIB) -o $@
 
 # ── ThreadSanitizer smoke ───────────────────────────────────────────────────
 # Re-builds sources + tests/test_threads.c with -fsanitize=thread and checks
@@ -199,13 +164,10 @@ tsan: $(TSAN_DIR)/test_threads
 	@printf "  %-7s %s\n" "TSAN" "test_threads"
 	@$<
 
-$(TSAN_DIR)/test_threads: $(SRCS) $(TESTDIR)/test_threads.c $(DECODER_LIB) $(DECODER_WRAP_HEADERS)
+$(TSAN_DIR)/test_threads: $(SRCS) $(TESTDIR)/test_threads.c
 	@mkdir -p $(TSAN_DIR)
 	@printf "  %-7s %s\n" "LINK" "test_threads (TSan)"
-	@$(CC) $(TSAN_FLAGS) $(INCLUDES) $(SRCS) $(TESTDIR)/test_threads.c \
-	  $(DECODER_LIB) $(DECODER_LDLIBS) -o $@
-
-.PHONY: tsan
+	@$(CC) $(TSAN_FLAGS) $(INCLUDES) $(SRCS) $(TESTDIR)/test_threads.c -o $@
 
 # ── Address/undefined sanitizer sweep ──────────────────────────────────────
 SAN_DIR   = $(BUILDDIR)/sanitize
@@ -218,11 +180,10 @@ sanitize: $(SAN_BINS)
 	  $$t || exit $$?; \
 	done
 
-$(SAN_DIR)/tests/%: $(TESTDIR)/%.c $(SRCS) $(DECODER_LIB) $(DECODER_WRAP_HEADERS)
+$(SAN_DIR)/tests/%: $(TESTDIR)/%.c $(SRCS)
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "LINK" "$(notdir $@) (ASan/UBSan)"
-	@$(CC) $(SAN_FLAGS) $(INCLUDES) $(SRCS) $< \
-	  $(DECODER_LIB) $(DECODER_LDLIBS) -o $@
+	@$(CC) $(SAN_FLAGS) $(INCLUDES) $(SRCS) $< -o $@
 
 # ── WebAssembly static library ─────────────────────────────────────────────
 WASM_BUILDDIR = $(BUILDDIR)/wasm
@@ -233,29 +194,16 @@ WASM_OBJS = $(patsubst $(ROOT)%.c, $(WASM_BUILDDIR)/%.o, $(SRCS))
 WASM_DEPS = $(WASM_OBJS:.o=.d)
 WASM_LIB  = $(WASM_BUILDDIR)/libkavak.a
 
-decoder-wasm: $(DECODER_WASM_LIB)
+wasm: $(WASM_LIB)
 
-$(DECODER_WASM_LIB): FORCE
-	$(require_decoder_root)
-	@$(MAKE) -C "$(DECODER_ROOT)" build/wasm/libunicode.a
-
-wasm: $(WASM_LIB) $(DECODER_WASM_LIB)
-	@echo "  decoder static: $(DECODER_WASM_LIB)"
-
-$(WASM_LIB): $(WASM_OBJS) $(DECODER_WASM_LIB) Makefile
+$(WASM_LIB): $(WASM_OBJS) Makefile
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "EMAR" "$(notdir $@)"
 	@rm -f $@
-	@{ \
-	  printf "CRE%s %s\n" "ATE" "$@"; \
-	  for obj in $(WASM_OBJS); do echo "ADDMOD $$obj"; done; \
-	  echo "ADDLIB $(DECODER_WASM_LIB)"; \
-	  echo "SAVE"; \
-	  echo "END"; \
-	} | $(WASM_AR) -M
-	@echo "  ✓ wasm libkavak + decoder"
+	@$(WASM_AR) rcs $@ $(WASM_OBJS)
+	@echo "  ✓ wasm libkavak"
 
-$(WASM_BUILDDIR)/%.o: $(ROOT)%.c $(DECODER_WRAP_HEADERS)
+$(WASM_BUILDDIR)/%.o: $(ROOT)%.c
 	@mkdir -p $(dir $@)
 	@printf "  %-7s %s\n" "EMCC" "$(notdir $<)"
 	@$(WASM_CC) $(WASM_CFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@

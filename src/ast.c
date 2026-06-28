@@ -32,6 +32,10 @@ void kavak_ast_append_child(KavakASTNode *parent, KavakASTNode *child) {
     parent->last_child = child;
     return;
   }
+  /* Repair an externally-inconsistent node (first_child set, last_child
+   * cleared) by walking to the tail — a tested defensive path for callers that
+   * splice first_child directly (see test_ast.c). The normal append below is
+   * O(1) because last_child already tracks the tail. */
   if (!parent->last_child) {
     KavakASTNode *tail = parent->first_child;
     while (tail->next_sibling) tail = tail->next_sibling;
